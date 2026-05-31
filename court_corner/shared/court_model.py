@@ -33,6 +33,25 @@ TEMPLATE_TYPES = np.array([
 
 LINE_WIDTH_M = 0.04  # 40mm
 
+# ================= 格網尺寸與投影小工具 =================
+# （供畫格線 / 投影使用；junction_idx = r * N_COL + c）
+N_COL, N_ROW = 5, 6
+
+
+def _tpl_xy(r, c):
+    """範本格 (r, c) 的場地座標 (公尺)。"""
+    p = TEMPLATE_POINTS[r * N_COL + c]
+    return (float(p[0]), float(p[1]))
+
+
+def _proj(H, X):
+    """以單應矩陣 H 把場地點 X=(x,y) 投影到影像座標。"""
+    H = np.asarray(H, dtype=np.float64)
+    v = H @ np.array([X[0], X[1], 1.0], dtype=np.float64)
+    if abs(v[2]) < 1e-12:
+        return (float("nan"), float("nan"))
+    return (float(v[0] / v[2]), float(v[1] / v[2]))
+
 
 # ================= 網格連接 =================
 

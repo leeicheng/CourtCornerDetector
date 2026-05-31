@@ -8,11 +8,16 @@
 
 - Python 3.8+
 - `numpy`、`opencv-python`、`scipy`
-- `ultralytics`（僅第一階段 YOLO 偵測需要；採延遲載入，未用到偵測時不需安裝）
+- `ultralytics`（第一階段 YOLO 偵測需要；採延遲載入）
+- `PyQt6`（僅 GUI 需要）
 
 ```bash
-pip install numpy opencv-python scipy ultralytics
+pip install -r requirements.txt
 ```
+
+線為主求 H 的演算法（原 `court_homography_tool.py` / `folder_yolo_tool.py` 的非 GUI
+部分）已**直接移植內嵌**於 `court_corner/homography/`，本工具自足、不需另外提供
+那兩支檔案。
 
 ## 使用方式
 
@@ -54,7 +59,8 @@ python court_corner_gui.py
 
 - **載入權重 (.pt)**、**載入影像** 或 **載入資料夾**（資料夾會列出所有影像，可在
   左側清單切換瀏覽）。
-- 可調 `yolo_conf` 與 `corner_conf`；勾選「選取後自動執行」則切換影像時自動跑。
+- 可選「暗線球場」；可調 `yolo_conf` 與 `corner_conf`；勾選「選取後自動執行」則
+  切換影像時自動跑。
 - 影像上繪出角點（依信心值上色：綠≥0.8、黃≥0.65、橙其餘）、cid 標籤、可選的
   H 格線與偵測交點；顯示選項即時重繪，不需重跑。
 - 右側角點表格 `(cid, x, y, conf, type, source)`；點選表格列會在影像上以紅圈標出
@@ -78,11 +84,14 @@ python court_corner_gui.py
   判讀模型 class 名稱關鍵字（`x`/`cross`→X、`t`→T、`l`/`corner`→L），純數字
   名稱則退回索引對應表。
 
-- **第二階段　拓樸求解（`stages/topology.py`）**
-  以「點對應」估計單應矩陣（template → image）。先取四個極值點對應模板四角，
-  嘗試二面體群（D2）的各種排列、以 DLT 求解並驗證；失敗則退回型別約束的
-  取樣 RANSAC。內含格網翻轉檢查、型別一致性、型別加權最近鄰指派、引導重擬合
-  與 Steger 次像素 H 精修。輸出 `H`、偵測↔模板對應與信心等級。
+- **第二階段　單應求解（線為主，`stages/topology_line.py` + `homography/`）**
+  以**內嵌移植**的線為主求解器求 H——全域 Steger 抽線 → cross-ratio 線標號 →
+  PROSAC → Steger 次像素精修，並以 line/type 一致性挑解。演算法移植自原
+  `court_homography_tool.py`（求解）與 `folder_yolo_tool.py`（抽線），去除其 GUI 後
+  放在 `court_corner/homography/solver.py` 與 `court_lines.py`。`topology_line.py`
+  為橋接：把 YOLO 偵測整理成 `Annotation` 清單、呼叫 `solver.solve_image()`，再把
+  投影點（`row*5+col` 即 junction_idx）整理成 Stage 3 需要的交點清單。其場地範本與
+  `shared.court_model` 完全相同，故輸出的 H 與 Stage 3 / 4 完全相容。
 
 - **第三階段　角點生成（`stages/corners.py`）**
   以單應矩陣將每個交點依型別（X→4 角、T→2、L→2）投影出白線外緣角點作為
@@ -106,26 +115,27 @@ python court_corner_gui.py
 
 ## 設計說明
 
-- **點對應式第二階段**：附件原始碼的拓樸求解依賴未隨附的全域白線抽取模組
-  （`folder_yolo_tool` / `s1_detection.steger_center` 等）。本工具改以偵測交點與
-  模板的「點對應」直接估計 H，不需事先抽取整場白線，較為自足且穩定。
+- **線為主求 H（內嵌移植）**：原 `court_homography_tool.py`（+`folder_yolo_tool.py`）
+  的非 GUI 演算法已直接移植到 `court_corner/homography/`（`solver.py` 與
+  `court_lines.py`），不再外部引用那兩支檔案。其 node 點為白線交點（次像素）、以
+  cross-ratio 線標號並用 line-consistency 挑解，再 Steger 精修，精度高；移植時僅去除
+  PyQt6 GUI 部分，演算法本身未改動，因此 H 與原工具一致。
 
-- **重新實作 Steger 脊線基元（`shared/steger.py`）**：補回缺漏的
-  `_steger_ridge_points_simple` 等函式。修正了 Hessian 特徵向量在軸對齊脊線
-  退化的問題（同時計算兩種特徵向量公式並取範數較大者），亮線極性以合成資料
-  驗證正確。
+- **重新實作 Steger 脊線基元（`shared/steger.py`）**：供 Stage 3 角點精修使用，
+  補回缺漏的 `_steger_ridge_points_simple` 等函式。修正了 Hessian 特徵向量在軸對齊
+  脊線退化的問題（同時計算兩種特徵向量公式並取範數較大者）。
 
 - **信心融合**：原始 `VertexQualityScorer` 的 composite 對「位於脊線上的角點」
   結構性偏低（差異圖 Harris−Steger 在線上相消），故第四階段改以幾何證據與
   影像支持相乘，兼顧幾何一致性與遮蔽偵測，輸出更合理之 `[0,1]` 信心值。
 
 - **單張影像的固有方向歧義**：羽球場版面在二面體群 D2（左右翻轉、上下翻轉、
-  180° 旋轉）下型別不變，故型別一致的有效 H 有四個。本工具沿用原始碼的方向
-  慣例（模板 +x 對應影像向右、+y 對應影像向下）的 `orient` 分數來穩定挑選，
-  與原始實作一致；此歧義為單張影像本質使然。
+  180° 旋轉）下型別不變，故型別一致的有效 H 有四個。`court_homography_tool` 以
+  line/type 一致性、vanishing point 與方向慣例（模板 +x→影像右、+y→影像下）來挑選；
+  此歧義為單張影像本質使然。
 
-- **參數來源**：因原始碼缺少設定檔，`config.py` 內各參數為依演算法逆向推得之
-  合理預設，皆已逐項註記，可視實際資料調整。
+- **參數來源**：本套件 `config.py` 內各參數為依演算法逆向推得之合理預設，皆已逐項
+  註記，可視實際資料調整。
 
 ## 套件結構
 
@@ -138,13 +148,18 @@ court_corner_tool/
   court_corner/
     __init__.py
     config.py                  各階段參數（逆向推得之預設，可調）
-    pipeline.py                四階段編排（CourtCornerPipeline）
+    pipeline.py                四階段編排（CourtCornerPipeline，線為主求 H）
     stages/                    四階段管線
       __init__.py
       detection.py             第一階段：JunctionDetector
-      topology.py              第二階段：TopologySolver（點對應 + H + 拓樸對應）
+      topology_line.py         第二階段：橋接 homography 求解器（線為主求 H）
       corners.py               第三階段：CornerGenerator（H 投影 + Steger 精修）
       quality.py               第四階段：QualityEvaluator（幾何 + 影像證據）
+    homography/                線為主求解器（移植自原工具，去除 GUI）
+      __init__.py
+      court_lines.py           全域 Steger 抽線 / 交點掛線（移植自 folder_yolo_tool）
+      solver.py                cross-ratio / PROSAC / Steger 精修 + solve_image
+                               （移植自 court_homography_tool）
     vertex/                    角點精修與品質支援模組
       __init__.py
       steger_vertex_finder.py  Steger 中線偏移角點萃取
@@ -154,6 +169,7 @@ court_corner_tool/
       reprojection.py          角點重投影誤差
     shared/                    場地模型與幾何基元
       __init__.py
+```
       court_model.py           場地模板點位、型別、角點編碼
       homography.py            單應幾何工具
       steger.py                Steger 脊線基元（重新實作補回）

@@ -58,18 +58,16 @@ def draw_viz(img_bgr, result, out_path):
     import numpy as np
     vis = img_bgr.copy()
     H = result.H
-    # 畫 H 投影球場格線（淡藍）
+    # 畫 H 投影球場格線（淡藍）；依真實球場連線，場中央中線在發球線間不連
     if H is not None:
-        from court_corner.stages.topology import _proj, _tpl_xy, N_ROW, N_COL
-        def P(r, c):
+        from court_corner.shared.court_model import (
+            _proj, _tpl_xy, N_COL, build_grid_connections)
+        def P(idx):
+            r, c = divmod(idx, N_COL)
             x, y = _proj(H, _tpl_xy(r, c))
             return (int(round(x)), int(round(y)))
-        for r in range(N_ROW):
-            for c in range(N_COL):
-                if c + 1 < N_COL:
-                    cv2.line(vis, P(r, c), P(r, c + 1), (255, 180, 60), 1, cv2.LINE_AA)
-                if r + 1 < N_ROW:
-                    cv2.line(vis, P(r, c), P(r + 1, c), (255, 180, 60), 1, cv2.LINE_AA)
+        for a, b in build_grid_connections():
+            cv2.line(vis, P(a), P(b), (255, 180, 60), 1, cv2.LINE_AA)
     # 畫偵測交點（黃）
     if result.detection is not None:
         for (x, y) in result.detection.node_pts:
@@ -103,7 +101,7 @@ def main(argv=None):
         yolo_weight=args.yolo_pt,
         yolo_conf=args.yolo_conf,
         corner_conf=args.corner_conf,
-        bright_lines=not args.dark_lines,
+        dark=args.dark_lines,
         verbose=verbose,
     )
     result = pipe.run(args.img_path)

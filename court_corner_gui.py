@@ -60,21 +60,19 @@ def annotate_image(img_bgr, result, opts: dict):
     vis = img_bgr.copy()
     H = getattr(result, "H", None)
 
-    # H 投影球場格線（淡藍）
+    # H 投影球場格線（淡藍）；依真實球場連線，場中央中線在發球線間不連
     if opts.get("grid", True) and H is not None:
         try:
-            from court_corner.stages.topology import _proj, _tpl_xy, N_ROW, N_COL
+            from court_corner.shared.court_model import (
+                _proj, _tpl_xy, N_COL, build_grid_connections)
 
-            def Pt(r, c):
+            def Pt(idx):
+                r, c = divmod(idx, N_COL)
                 x, y = _proj(H, _tpl_xy(r, c))
                 return (int(round(x)), int(round(y)))
 
-            for r in range(N_ROW):
-                for c in range(N_COL):
-                    if c + 1 < N_COL:
-                        cv2.line(vis, Pt(r, c), Pt(r, c + 1), (255, 170, 60), 1, cv2.LINE_AA)
-                    if r + 1 < N_ROW:
-                        cv2.line(vis, Pt(r, c), Pt(r + 1, c), (255, 170, 60), 1, cv2.LINE_AA)
+            for a, b in build_grid_connections():
+                cv2.line(vis, Pt(a), Pt(b), (255, 170, 60), 1, cv2.LINE_AA)
         except Exception:
             pass
 
@@ -159,49 +157,47 @@ class Worker(QObject):
         super().__init__()
         self._pipeline = None
         self._weights = None
+        self._dark = None
 
     # ----------------------------------------------------------------
-    def _ensure_pipeline(self, weights, yolo_conf, corner_conf):
-        """需要時建立 / 重建 pipeline；權重不變則沿用（模型不重載），僅更新參數。"""
+    def _ensure_pipeline(self, weights, yolo_conf, corner_conf, dark):
+        """需要時建立 / 重建 pipeline；權重 / 暗線不變則沿用（模型不重載）。"""
         from court_corner.pipeline import CourtCornerPipeline
-        if self._pipeline is None or self._weights != weights:
-            self.sig_status.emit(f"載入權重並初始化管線：{os.path.basename(weights)} …")
+        if (self._pipeline is None or self._weights != weights or self._dark != dark):
+            self.sig_status.emit(f"初始化管線（線為主）：{os.path.basename(weights)} …")
             self._pipeline = CourtCornerPipeline(
-                yolo_weight=weights, yolo_conf=yolo_conf,
-                corner_conf=corner_conf, verbose=False)
-            self._weights = weights
+                yolo_weight=weights, yolo_conf=yolo_conf, corner_conf=corner_conf,
+                dark=dark, verbose=False)
+            self._weights, self._dark = weights, dark
         else:
-            # 僅更新參數，不重載模型
             self._pipeline.detector.conf = float(yolo_conf)
             self._pipeline.evaluator.corner_conf = float(corner_conf)
         return self._pipeline
 
     # ----------------------------------------------------------------
-    @pyqtSlot(str, str, float, float)
-    def run_single(self, path, weights, yolo_conf, corner_conf):
+    @pyqtSlot(str, str, float, float, bool)
+    def run_single(self, path, weights, yolo_conf, corner_conf, dark):
         try:
             img = cv2.imread(path, cv2.IMREAD_COLOR)
             if img is None:
                 self.sig_error.emit(f"無法讀取影像：{path}")
                 return
-            pipe = self._ensure_pipeline(weights, yolo_conf, corner_conf)
+            pipe = self._ensure_pipeline(weights, yolo_conf, corner_conf, dark)
             self.sig_status.emit(f"執行中：{os.path.basename(path)} …")
             result = pipe.run_image(img)
             self.sig_single_done.emit(path, img, result)
             self.sig_status.emit(_result_summary(path, result))
         except ImportError as e:
-            self.sig_error.emit(
-                "缺少 ultralytics 套件，無法執行第一階段 YOLO 偵測。\n"
-                "請先安裝：pip install ultralytics\n\n" + str(e))
+            self.sig_error.emit(_import_error_hint(str(e)))
         except Exception as e:
             self.sig_error.emit("執行發生例外：\n" + "".join(
                 traceback.format_exception(type(e), e, e.__traceback__)))
 
     # ----------------------------------------------------------------
-    @pyqtSlot(list, str, str, float, float, dict)
-    def run_batch(self, paths, out_dir, weights, yolo_conf, corner_conf, opts):
+    @pyqtSlot(list, str, str, float, float, dict, bool)
+    def run_batch(self, paths, out_dir, weights, yolo_conf, corner_conf, opts, dark):
         try:
-            pipe = self._ensure_pipeline(weights, yolo_conf, corner_conf)
+            pipe = self._ensure_pipeline(weights, yolo_conf, corner_conf, dark)
             os.makedirs(out_dir, exist_ok=True)
             n = len(paths)
             ok = 0
@@ -225,21 +221,26 @@ class Worker(QObject):
                 ok += 1
             self.sig_batch_done.emit(out_dir, ok)
         except ImportError as e:
-            self.sig_error.emit(
-                "缺少 ultralytics 套件，無法執行第一階段 YOLO 偵測。\n"
-                "請先安裝：pip install ultralytics\n\n" + str(e))
+            self.sig_error.emit(_import_error_hint(str(e)))
         except Exception as e:
             self.sig_error.emit("批次執行發生例外：\n" + "".join(
                 traceback.format_exception(type(e), e, e.__traceback__)))
+
+
+def _import_error_hint(detail):
+    return ("缺少必要套件。\n"
+            "• 第一階段 YOLO 需要 ultralytics：pip install ultralytics\n\n" + detail)
 
 
 def _result_summary(path, result):
     name = os.path.basename(path)
     if getattr(result, "status", "") == "ok":
         rep = result.report or {}
+        hg = result._homography_dict()
+        extra = hg.get("solver_method") or hg.get("method", "")
         return (f"{name}：輸出 {len(result.corners)} 角點"
                 f"（候選 {rep.get('n_candidates', '?')}，conf≥{rep.get('corner_conf', '?')}）"
-                f"，拓樸 {result.topology.confidence if result.topology else '?'}")
+                f"，H 信心 {getattr(result, 'confidence', '?')}（{extra}）")
     return f"{name}：{getattr(result, 'message', '失敗')}"
 
 
@@ -248,8 +249,8 @@ def _result_summary(path, result):
 # ════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
     # 主執行緒 → worker
-    sig_req_single = pyqtSignal(str, str, float, float)
-    sig_req_batch = pyqtSignal(list, str, str, float, float, dict)
+    sig_req_single = pyqtSignal(str, str, float, float, bool)
+    sig_req_batch = pyqtSignal(list, str, str, float, float, dict, bool)
 
     def __init__(self):
         super().__init__()
@@ -297,6 +298,9 @@ class MainWindow(QMainWindow):
         self.spin_corner.setValue(0.60); self.spin_corner.setDecimals(2)
         self.spin_corner.valueChanged.connect(self.on_param_changed)
 
+        self.chk_dark = QCheckBox("暗線球場")
+        self.chk_dark.stateChanged.connect(self.on_param_changed)
+
         self.btn_run = QPushButton("執行（目前影像）")
         self.btn_run.clicked.connect(self.on_run_current)
         self.btn_batch = QPushButton("批次處理資料夾…")
@@ -318,6 +322,11 @@ class MainWindow(QMainWindow):
         cl.addWidget(self.spin_corner, 1, 3)
         cl.addWidget(self.btn_run, 1, 4)
         cl.addWidget(self.btn_batch, 1, 5)
+
+        method_row = QHBoxLayout()
+        method_row.addWidget(self.chk_dark)
+        method_row.addStretch(1)
+        cl.addLayout(method_row, 3, 0, 1, 6)
 
         # 顯示選項
         self.chk_grid = QCheckBox("格線"); self.chk_grid.setChecked(True)
@@ -484,7 +493,8 @@ class MainWindow(QMainWindow):
             return
         self._set_busy(True)
         self.sig_req_single.emit(self.cur_path, self.weights_path,
-                                 self.spin_yolo.value(), self.spin_corner.value())
+                                 self.spin_yolo.value(), self.spin_corner.value(),
+                                 self.chk_dark.isChecked())
 
     def on_run_batch(self):
         if self._busy:
@@ -503,7 +513,8 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, len(self.image_paths))
         self.progress.setValue(0)
         self.sig_req_batch.emit(list(self.image_paths), out_dir, self.weights_path,
-                                self.spin_yolo.value(), self.spin_corner.value(), self._opts())
+                                self.spin_yolo.value(), self.spin_corner.value(), self._opts(),
+                                self.chk_dark.isChecked())
 
     def on_param_changed(self, _):
         # 參數變更 → 快取失效（重新執行才會套用新參數）
