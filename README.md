@@ -41,6 +41,31 @@ python detect_corners.py --img_path court.jpg --yolo.pt weights/best.pt \
 角點編碼（corner_id）。JSON 另含單應矩陣 `H`、拓樸求解摘要與各角點的
 `junction_idx`、`corner_type`、`source`、`reproj_err_m` 等診斷欄位。
 
+## 圖形介面（GUI）
+
+提供 PyQt6 圖形介面 `court_corner_gui.py`，可載入權重與影像（或整個資料夾）、
+執行管線並把角點畫在影像上。
+
+```bash
+python court_corner_gui.py
+```
+
+功能：
+
+- **載入權重 (.pt)**、**載入影像** 或 **載入資料夾**（資料夾會列出所有影像，可在
+  左側清單切換瀏覽）。
+- 可調 `yolo_conf` 與 `corner_conf`；勾選「選取後自動執行」則切換影像時自動跑。
+- 影像上繪出角點（依信心值上色：綠≥0.8、黃≥0.65、橙其餘）、cid 標籤、可選的
+  H 格線與偵測交點；顯示選項即時重繪，不需重跑。
+- 右側角點表格 `(cid, x, y, conf, type, source)`；點選表格列會在影像上以紅圈標出
+  該角點。滑鼠滾輪縮放、拖曳平移、「符合視窗」一鍵還原。
+- **批次處理資料夾…**：對整個資料夾逐張執行，將標註圖（`*_annotated.png`）與
+  `*_corners.json` 存到指定輸出資料夾。
+- **儲存標註圖** / **儲存 JSON**：輸出目前影像的結果。
+
+模型只在第一次執行時載入一次，之後切換影像或調整參數都沿用同一模型；管線在
+背景執行緒執行，介面不會卡住。
+
 ## 四階段架構
 
 ```
@@ -109,6 +134,7 @@ court_corner_tool/
   README.md
   requirements.txt             相依套件
   detect_corners.py            指令入口（CLI）
+  court_corner_gui.py          圖形介面（PyQt6）
   court_corner/
     __init__.py
     config.py                  各階段參數（逆向推得之預設，可調）
