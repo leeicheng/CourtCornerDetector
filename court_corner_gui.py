@@ -29,13 +29,14 @@ import cv2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QAction
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QAction, QPen, QBrush, QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem, QDoubleSpinBox, QCheckBox,
     QFileDialog, QTableWidget, QTableWidgetItem, QPlainTextEdit, QSplitter,
     QGroupBox, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QProgressBar,
     QMessageBox, QHeaderView, QSizePolicy,
+    QGraphicsItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsSimpleTextItem,
 )
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
@@ -50,6 +51,14 @@ def fmt_duration(s):
     if s < 1.0:
         return f"{s * 1000:.0f} ms"
     return f"{s:.2f} s"
+
+
+def conf_rgb(conf: float):
+    """依信心值給顏色（RGB，給 Qt 用）。"""
+    b, g, r = conf_color_bgr(conf)
+    return (r, g, b)
+
+
 # ════════════════════════════════════════════════════════════════
 #  繪圖：把管線結果畫到影像上（worker 批次存檔與主視窗顯示共用）
 # ════════════════════════════════════════════════════════════════
@@ -127,6 +136,7 @@ class ImageViewer(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setBackgroundBrush(Qt.GlobalColor.darkGray)
         self._has_img = False
+        self._overlay = []          # 角點向量標記（sub-pixel）
 
     def set_image_bgr(self, bgr):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -139,6 +149,55 @@ class ImageViewer(QGraphicsView):
         self._has_img = True
         if first:
             self.fit()
+
+    # --- 角點向量疊圖：以精確 (x, y) 浮點座標放置、且大小不隨縮放改變 ---
+    # 這樣放大時十字中心仍落在 sub-pixel 位置，可看出非整數像素的精度。
+    def clear_corner_overlay(self):
+        for it in self._overlay:
+            self._scene.removeItem(it)
+        self._overlay = []
+
+    def set_corner_overlay(self, corners, show_labels=True, show_conf=False,
+                           selected=-1):
+        self.clear_corner_overlay()
+        if not self._has_img:
+            return
+        for i, c in enumerate(corners):
+            x, y = float(c.x), float(c.y)
+            r, g, b = conf_rgb(c.conf)
+            col = QColor(r, g, b)
+            arm, rad = 7, 4
+            # 父項＝小圈，設於精確 sub-pixel 場景座標、大小不隨縮放改變；
+            # 其餘（十字、選取環、標籤）為子項，子座標即螢幕像素（不會隨縮放飄移）。
+            cir = QGraphicsEllipseItem(-rad, -rad, 2 * rad, 2 * rad)
+            cir.setPos(x, y)
+            pen = QPen(QColor(20, 20, 20), 1); pen.setCosmetic(True)
+            cir.setPen(pen); cir.setBrush(QBrush(col))
+            cir.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            cir.setZValue(10)
+            self._scene.addItem(cir)
+            self._overlay.append(cir)
+            # 十字（中心 = 精確 sub-pixel 點）
+            for (dx0, dy0, dx1, dy1) in ((-arm, 0, arm, 0), (0, -arm, 0, arm)):
+                ln = QGraphicsLineItem(dx0, dy0, dx1, dy1, cir)
+                lp = QPen(col, 1.4); lp.setCosmetic(True)
+                ln.setPen(lp)
+            # 選取高亮
+            if i == selected:
+                ring = QGraphicsEllipseItem(-11, -11, 22, 22, cir)
+                rp = QPen(QColor(255, 0, 0), 2); rp.setCosmetic(True)
+                ring.setPen(rp); ring.setBrush(QBrush(Qt.GlobalColor.transparent))
+            # 標籤（子項；偏移 8,-18 為螢幕像素）
+            label = ""
+            if show_labels:
+                label = str(c.cid)
+            if show_conf:
+                label = (label + " " if label else "") + f"{c.conf:.2f}"
+            if label:
+                t = QGraphicsSimpleTextItem(label, cir)
+                t.setPos(8, -18)
+                t.setBrush(QBrush(col))
+                f = QFont(); f.setPointSize(8); t.setFont(f)
 
     def fit(self):
         if not self._has_img:
@@ -160,8 +219,8 @@ class Worker(QObject):
     sig_error = pyqtSignal(str)
     sig_single_done = pyqtSignal(object, object, object)      # path, img_bgr, result
     sig_result_only = pyqtSignal(object, object)             # path, result（批次用，不帶影像）
-    sig_batch_progress = pyqtSignal(int, int, str)           # done, total, path
-    sig_batch_done = pyqtSignal(str, int)                    # out_dir, count
+    sig_batch_progress = pyqtSignal(int, int, str, float)    # done, total, path, last_image_s
+    sig_batch_done = pyqtSignal(str, int, float)             # out_dir, count, total_s
 
     def __init__(self):
         super().__init__()
@@ -238,7 +297,12 @@ class Worker(QObject):
                     json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
                 self.sig_result_only.emit(path, result)
                 ok += 1
-            self.sig_batch_done.emit(out_dir, ok)
+                el = float(getattr(result, "elapsed_s", 0.0))
+                self.sig_status.emit(f"  {os.path.basename(path)}：{el:.2f}s，"
+                                     f"{len(result.corners)} 角點")
+                self.sig_batch_progress.emit(i, n, path, el)
+            total = time.perf_counter() - t_batch
+            self.sig_batch_done.emit(out_dir, ok, total)
         except ImportError as e:
             self.sig_error.emit(_import_error_hint(str(e)))
         except Exception as e:
@@ -257,9 +321,14 @@ def _result_summary(path, result):
         rep = result.report or {}
         hg = result._homography_dict()
         extra = hg.get("solver_method") or hg.get("method", "")
+        sup = hg.get("line_support")
+        sup_txt = ""
+        if sup is not None:
+            sup_txt = f"，線支持 {sup:.2f}" + ("" if hg.get("line_support_ok", True) else "⚠不足")
         return (f"{name}：輸出 {len(result.corners)} 角點"
                 f"（候選 {rep.get('n_candidates', '?')}，conf≥{rep.get('corner_conf', '?')}）"
-                f"，H 信心 {getattr(result, 'confidence', '?')}（{extra}）")
+                f"，H 信心 {getattr(result, 'confidence', '?')}（{extra}）{sup_txt}"
+                f"，處理 {fmt_duration(getattr(result, 'elapsed_s', 0.0))}")
     return f"{name}：{getattr(result, 'message', '失敗')}"
 
 
@@ -598,16 +667,25 @@ class MainWindow(QMainWindow):
             self._render_current()
 
     # ================= 繪製 / 表格 =================
-    def _render_current(self):
+    def _render_current(self, selected=-1):
         if self.cur_img is None:
             return
         result = self.results.get(self.cur_path)
         if result is None:
             self.viewer.set_image_bgr(self.cur_img)
+            self.viewer.clear_corner_overlay()
             self._fill_table(None)
             return
-        vis = annotate_image(self.cur_img, result, self._opts())
+        opts = self._opts()
+        # 背景只烤格線與偵測點；角點改用向量疊圖（可顯示 sub-pixel）
+        bg_opts = dict(opts); bg_opts["corners"] = False
+        vis = annotate_image(self.cur_img, result, bg_opts)
         self.viewer.set_image_bgr(vis)
+        self.viewer.set_corner_overlay(
+            result.corners if opts.get("corners", True) else [],
+            show_labels=opts.get("labels", True),
+            show_conf=opts.get("conf", False),
+            selected=selected)
         self._fill_table(result)
         # 切換到已處理影像時，時間標籤也顯示該張的處理時間
         self.lbl_time.setText(f"處理時間：{fmt_duration(getattr(result, 'elapsed_s', 0.0))}")
@@ -619,7 +697,7 @@ class MainWindow(QMainWindow):
             for c in getattr(result, "corners", []):
                 r = self.table.rowCount()
                 self.table.insertRow(r)
-                vals = [str(c.cid), f"{c.x:.1f}", f"{c.y:.1f}", f"{c.conf:.3f}",
+                vals = [str(c.cid), f"{c.x:.2f}", f"{c.y:.2f}", f"{c.conf:.3f}",
                         c.corner_type, c.source]
                 for j, v in enumerate(vals):
                     self.table.setItem(r, j, QTableWidgetItem(v))
@@ -636,10 +714,13 @@ class MainWindow(QMainWindow):
         row = items[0].row()
         if row >= len(result.corners):
             return
-        c = result.corners[row]
-        vis = annotate_image(self.cur_img, result, self._opts())
-        cv2.circle(vis, (int(round(c.x)), int(round(c.y))), 11, (0, 0, 255), 2, cv2.LINE_AA)
-        self.viewer.set_image_bgr(vis)
+        # 以向量疊圖高亮選取的角點（保留 sub-pixel 精度）
+        opts = self._opts()
+        self.viewer.set_corner_overlay(
+            result.corners if opts.get("corners", True) else result.corners,
+            show_labels=opts.get("labels", True),
+            show_conf=opts.get("conf", False),
+            selected=row)
 
     # ================= 儲存 =================
     def on_save_image(self):
