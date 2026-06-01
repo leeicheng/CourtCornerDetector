@@ -17,6 +17,7 @@ pipeline.py — 四階段角點定位管線編排（線為主求 H）
 
 from __future__ import annotations
 
+import time
 from typing import List, Optional
 
 import numpy as np
@@ -41,6 +42,8 @@ class PipelineResult:
         self.line = None                        # LineHomographyResult
         self.report: dict = {}
         self.message: str = ""
+        self.elapsed_s: float = 0.0             # 整體處理時間（秒）
+        self.stage_times: dict = {}             # 各階段耗時（秒）
 
     def corners_as_tuples(self):
         return [c.as_tuple() for c in self.corners]
@@ -53,6 +56,8 @@ class PipelineResult:
                 "confidence": self.confidence,
                 "line_consistency": round(lr.line_consistency, 4),
                 "type_consistency": round(lr.type_consistency, 4),
+                "line_support": round(lr.line_support, 4),
+                "line_support_ok": bool(lr.line_support_ok),
                 "solver_method": lr.method,
                 "n_steger_refined": lr.n_steger_refined,
                 "n_courts": lr.n_courts,
@@ -64,6 +69,8 @@ class PipelineResult:
         return {
             "status": self.status,
             "message": self.message,
+            "elapsed_s": round(self.elapsed_s, 3),
+            "stage_times": {k: round(v, 3) for k, v in self.stage_times.items()},
             "H": (self.H.tolist() if self.H is not None else None),
             "n_detections": (len(self.detection) if self.detection else 0),
             "homography": self._homography_dict(),
@@ -89,6 +96,7 @@ class CourtCornerPipeline:
                  corner_conf: float = None,
                  dark: bool = False,
                  bright_lines: bool = None,
+                 min_line_support: float = 0.45,
                  verbose: bool = True):
         self.verbose = verbose
         self.dark = dark
@@ -99,7 +107,8 @@ class CourtCornerPipeline:
         self.detector = JunctionDetector(yolo_weight, conf=yolo_conf, verbose=verbose)
         # Stage 2（線為主）
         from .stages.topology_line import LineHomographySolver
-        self.line_solver = LineHomographySolver(dark=dark, steger_refine=True)
+        self.line_solver = LineHomographySolver(
+            dark=dark, steger_refine=True, min_line_support=min_line_support)
         # Stage 3 / 4
         self.generator = CornerGenerator(bright_lines=self.bright_lines)
         self.evaluator = QualityEvaluator(corner_conf=corner_conf)
@@ -128,23 +137,30 @@ class CourtCornerPipeline:
         """
         out = PipelineResult()
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if img_bgr.ndim == 3 else img_bgr
+        t0 = time.perf_counter()
 
         # ---- Stage 1 ----
+        ts = time.perf_counter()
         if detection is None:
             detection = self.detector.detect(img_bgr)
+        out.stage_times["detect"] = time.perf_counter() - ts
         out.detection = detection
         if len(detection) < 4:
             out.message = f"第一階段交點不足（{len(detection)} < 4），無法求解單應矩陣。"
+            out.elapsed_s = time.perf_counter() - t0
             self._log("[Pipeline]", out.message)
             return out
 
         # ---- Stage 2（線為主）----
+        ts = time.perf_counter()
         from .stages.topology_line import detection_to_anns
         anns, class_names = detection_to_anns(detection)
         line_res = self.line_solver.solve(img_bgr, anns, class_names)
+        out.stage_times["solve_H"] = time.perf_counter() - ts
         out.line = line_res
         if line_res.status != "ok" or line_res.H is None:
             out.message = f"第二階段（線為主）求解失敗：{line_res.message}"
+            out.elapsed_s = time.perf_counter() - t0
             self._log("[Pipeline]", out.message)
             return out
         out.H = line_res.H
@@ -152,21 +168,28 @@ class CourtCornerPipeline:
         junctions = line_res.junctions
         self._log(f"[Stage2/line] H 求解成功  method={line_res.method}  "
                   f"lc={line_res.line_consistency:.3f}  tc={line_res.type_consistency:.3f}  "
+                  f"線支持={line_res.line_support:.2f}{'' if line_res.line_support_ok else '(不足)'}  "
                   f"steger_refined={line_res.n_steger_refined}  交點={len(junctions)}")
 
         # ---- Stage 3 ----
+        ts = time.perf_counter()
         candidates = self.generator.generate(gray, out.H, junctions)
+        out.stage_times["corners"] = time.perf_counter() - ts
         self._log(f"[Stage3] 由 {len(junctions)} 個交點生成 {len(candidates)} 個角點候選")
 
         # ---- Stage 4 ----
+        ts = time.perf_counter()
         corners, report = self.evaluator.evaluate(
             gray, candidates, H=out.H, geom_quality=out.confidence)
+        out.stage_times["quality"] = time.perf_counter() - ts
         out.corners = corners
         out.report = report
         out.status = "ok"
+        out.elapsed_s = time.perf_counter() - t0
         out.message = (f"完成：輸出 {len(corners)} 個角點"
                        f"（候選 {report['n_candidates']}，門檻 conf≥{report['corner_conf']}）")
-        self._log("[Stage4]", out.message)
+        self._log("[Stage4]", out.message,
+                  f"｜處理時間 {out.elapsed_s:.2f}s")
         return out
 
 

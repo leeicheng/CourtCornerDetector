@@ -19,6 +19,7 @@ import os
 import sys
 import json
 import glob
+import time
 import traceback
 
 import numpy as np
@@ -40,6 +41,15 @@ from PyQt6.QtWidgets import (
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
 
+def fmt_duration(s):
+    """處理時間格式化：未滿 1 秒以毫秒顯示，避免四捨五入成 0。"""
+    try:
+        s = float(s)
+    except (TypeError, ValueError):
+        return "—"
+    if s < 1.0:
+        return f"{s * 1000:.0f} ms"
+    return f"{s:.2f} s"
 # ════════════════════════════════════════════════════════════════
 #  繪圖：把管線結果畫到影像上（worker 批次存檔與主視窗顯示共用）
 # ════════════════════════════════════════════════════════════════
@@ -184,7 +194,14 @@ class Worker(QObject):
                 return
             pipe = self._ensure_pipeline(weights, yolo_conf, corner_conf, dark)
             self.sig_status.emit(f"執行中：{os.path.basename(path)} …")
+            t = time.perf_counter()
             result = pipe.run_image(img)
+            wall = time.perf_counter() - t
+            # 以 worker 量到的牆鐘時間為準（涵蓋全程，避免內部計時為 0 的疑慮）
+            try:
+                result.elapsed_s = float(wall)
+            except Exception:
+                pass
             self.sig_single_done.emit(path, img, result)
             self.sig_status.emit(_result_summary(path, result))
         except ImportError as e:
@@ -201,15 +218,17 @@ class Worker(QObject):
             os.makedirs(out_dir, exist_ok=True)
             n = len(paths)
             ok = 0
+            t_batch = time.perf_counter()
             for i, path in enumerate(paths, 1):
-                self.sig_batch_progress.emit(i, n, path)
                 img = cv2.imread(path, cv2.IMREAD_COLOR)
                 if img is None:
+                    self.sig_batch_progress.emit(i, n, path, 0.0)
                     continue
                 try:
                     result = pipe.run_image(img)
                 except Exception as e:
                     self.sig_status.emit(f"  跳過 {os.path.basename(path)}：{e}")
+                    self.sig_batch_progress.emit(i, n, path, 0.0)
                     continue
                 stem = os.path.splitext(os.path.basename(path))[0]
                 vis = annotate_image(img, result, opts)
@@ -389,7 +408,10 @@ class MainWindow(QMainWindow):
         bottom = QHBoxLayout()
         self.progress = QProgressBar(); self.progress.setVisible(False)
         self.lbl_status = QLabel("就緒")
+        self.lbl_time = QLabel("處理時間：—")
+        self.lbl_time.setStyleSheet("color:#2a6; font-weight:bold;")
         bottom.addWidget(self.lbl_status, 1)
+        bottom.addWidget(self.lbl_time)
         bottom.addWidget(self.progress)
         outer.addLayout(bottom)
 
@@ -465,7 +487,9 @@ class MainWindow(QMainWindow):
             self._render_current()
         else:
             self.viewer.set_image_bgr(self.cur_img)   # 先顯示原圖
+            self.viewer.clear_corner_overlay()
             self._fill_table(None)
+            self.lbl_time.setText("處理時間：—")
             if self.chk_auto.isChecked() and self.weights_path and not self._busy:
                 self.on_run_current()
 
@@ -544,24 +568,32 @@ class MainWindow(QMainWindow):
         if path == self.cur_path:
             self.cur_img = img
             self._render_current()
+        self.lbl_time.setText(f"處理時間：{fmt_duration(getattr(result, 'elapsed_s', 0.0))}")
         self._set_busy(False)
 
     @pyqtSlot(object, object)
     def on_result_only(self, path, result):
         self.results[path] = result
 
-    @pyqtSlot(int, int, str)
-    def on_batch_progress(self, done, total, path):
+    @pyqtSlot(int, int, str, float)
+    def on_batch_progress(self, done, total, path, last_s):
         self.progress.setValue(done)
-        self.lbl_status.setText(f"批次處理 {done}/{total}：{os.path.basename(path)}")
+        self.lbl_status.setText(
+            f"批次處理 {done}/{total}：{os.path.basename(path)}（{fmt_duration(last_s)}）")
+        self.lbl_time.setText(f"處理時間：{fmt_duration(last_s)}（上一張）")
 
-    @pyqtSlot(str, int)
-    def on_batch_done(self, out_dir, count):
+    @pyqtSlot(str, int, float)
+    def on_batch_done(self, out_dir, count, total_s):
         self._set_busy(False)
         self.progress.setVisible(False)
-        self._log(f"批次完成：{count} 張，輸出於 {out_dir}")
+        avg = (total_s / count) if count else 0.0
+        self._log(f"批次完成：{count} 張，總時間 {fmt_duration(total_s)}"
+                  f"（平均 {fmt_duration(avg)}/張），輸出於 {out_dir}")
+        self.lbl_time.setText(f"處理時間：總 {fmt_duration(total_s)}／平均 {fmt_duration(avg)}")
         QMessageBox.information(self, "批次完成",
-                                f"已處理 {count} 張影像。\n標註圖與 JSON 已存至：\n{out_dir}")
+                                f"已處理 {count} 張影像。\n"
+                                f"總時間 {fmt_duration(total_s)}，平均 {fmt_duration(avg)}/張。\n"
+                                f"標註圖與 JSON 已存至：\n{out_dir}")
         if self.cur_path in self.results:
             self._render_current()
 
@@ -577,6 +609,8 @@ class MainWindow(QMainWindow):
         vis = annotate_image(self.cur_img, result, self._opts())
         self.viewer.set_image_bgr(vis)
         self._fill_table(result)
+        # 切換到已處理影像時，時間標籤也顯示該張的處理時間
+        self.lbl_time.setText(f"處理時間：{fmt_duration(getattr(result, 'elapsed_s', 0.0))}")
 
     def _fill_table(self, result):
         self.table.blockSignals(True)
@@ -641,6 +675,8 @@ class MainWindow(QMainWindow):
                   self.btn_image, self.btn_folder):
             w.setEnabled(not busy)
         self.lbl_status.setText("處理中…" if busy else "就緒")
+        if busy:
+            self.lbl_time.setText("處理時間：計時中…")
 
     def _log(self, msg):
         self.log.appendPlainText(str(msg))
