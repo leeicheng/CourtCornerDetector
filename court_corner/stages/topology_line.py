@@ -59,6 +59,8 @@ class LineHomographyResult:
         self.method = ""
         self.n_steger_refined = 0
         self.n_courts = 0
+        self.line_support = 0.0                              # 投影格線的白線支持度 [0,1]
+        self.line_support_ok = False                         # 是否達線支持門檻
         self.message = ""
         self.raw = None
 
@@ -77,19 +79,30 @@ class LineHomographySolver:
     """
 
     def __init__(self, dark: bool = False, steger_refine: bool = True,
-                 image_margin: int = 4):
+                 image_margin: int = 4, min_line_support: float = 0.45):
         self.dark = dark
         self.steger_refine = steger_refine
         self.image_margin = image_margin
+        self.min_line_support = float(min_line_support)
+        from .line_support import LineSupportScorer
+        self._scorer = LineSupportScorer(dark=dark)
 
     # ----------------------------------------------------------------
     @staticmethod
-    def _grade(lc: float, tc: float) -> str:
+    def _grade(lc: float, tc: float, support: float, support_ok: bool) -> str:
+        # 線支持不足 → 直接視為低信心（H 在影像上沒有足夠白線支持）
+        if not support_ok:
+            return "low"
         if lc >= 0.95 and tc >= 0.90:
-            return "high"
-        if lc >= 0.80 and tc >= 0.75:
-            return "medium"
-        return "low"
+            base = "high"
+        elif lc >= 0.80 and tc >= 0.75:
+            base = "medium"
+        else:
+            base = "low"
+        # 支持度偏低時不給 high
+        if base == "high" and support < 0.60:
+            base = "medium"
+        return base
 
     # ----------------------------------------------------------------
     def solve(self, img_bgr, anns, class_names) -> LineHomographyResult:
@@ -111,10 +124,25 @@ class LineHomographySolver:
             out.message = "線為主求解未得到可靠 H。" + (f"（{reason}）" if reason else "")
             return out
 
-        # 多球場時挑最佳：線一致性 + 型別一致性 → 對應點數
-        best = max(oks, key=lambda c: (c.get("line_consistency", 0.0)
-                                       + c.get("type_consistency", 0.0),
-                                       c.get("num_corr", 0)))
+        # 計算每座球場的白線支持度
+        gray = img_bgr if img_bgr.ndim == 2 else None
+        scored = []
+        for c in oks:
+            Hc = np.asarray(c["H"], dtype=np.float64)
+            sup = self._scorer.score(img_bgr, Hc)["support"]
+            scored.append((c, sup))
+
+        gate = self.min_line_support
+        passed = [(c, s) for (c, s) in scored if s >= gate]
+        if passed:
+            # 有線支持者中以「第 1 座」為主（court 索引最小）
+            best, best_sup = min(passed, key=lambda cs: cs[0].get("court", 0))
+            support_ok = True
+        else:
+            # 都缺線支持 → 取支持度最高者，但標記為不可靠
+            best, best_sup = max(scored, key=lambda cs: cs[1])
+            support_ok = False
+
         H = np.asarray(best["H"], dtype=np.float64)
         out.H = H
         out.raw = best
@@ -122,7 +150,10 @@ class LineHomographySolver:
         out.type_consistency = float(best.get("type_consistency", 0.0))
         out.method = str(best.get("method", ""))
         out.n_steger_refined = int(best.get("steger_refined", 0) or 0)
-        out.confidence = self._grade(out.line_consistency, out.type_consistency)
+        out.line_support = float(best_sup)
+        out.line_support_ok = bool(support_ok)
+        out.confidence = self._grade(out.line_consistency, out.type_consistency,
+                                     best_sup, support_ok)
 
         # 交點清單：用 res['projected']（row*5+col = junction_idx），取影像內者，
         # center_px 用 H 投影位置（已經過 Steger 精修，對齊實際白線）。
@@ -151,8 +182,10 @@ class LineHomographySolver:
 
         out.junctions = junctions
         out.status = "ok"
+        tag = "" if out.line_support_ok else "，⚠ 白線支持不足，結果可能不可靠"
         out.message = (f"線為主求解成功（method={out.method}，lc={out.line_consistency:.3f}，"
-                       f"tc={out.type_consistency:.3f}，交點 {len(junctions)}）")
+                       f"tc={out.type_consistency:.3f}，線支持={out.line_support:.2f}，"
+                       f"交點 {len(junctions)}{tag}）")
         return out
 
 

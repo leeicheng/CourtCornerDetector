@@ -44,6 +44,8 @@ def build_parser():
                    help="YOLO 偵測信心門檻")
     p.add_argument("--corner_conf", type=float, default=0.6,
                    help="角點輸出信心門檻")
+    p.add_argument("--min_line_support", type=float, default=0.45,
+                   help="H 的白線支持度門檻（投影格線需落在影像白線上）；低於此標記為不可靠")
     p.add_argument("--out", default=None,
                    help="輸出 JSON 路徑（預設 <影像名>_corners.json）")
     p.add_argument("--viz", default=None, help="輸出視覺化疊圖路徑（可選）")
@@ -102,6 +104,7 @@ def main(argv=None):
         yolo_conf=args.yolo_conf,
         corner_conf=args.corner_conf,
         dark=args.dark_lines,
+        min_line_support=args.min_line_support,
         verbose=verbose,
     )
     result = pipe.run(args.img_path)
