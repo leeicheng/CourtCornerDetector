@@ -35,6 +35,7 @@ python detect_corners.py --img_path court.jpg --yolo.pt weights/best.pt \
 | `--img_path` | 單張影像路徑（必填） | — |
 | `--yolo_conf` | YOLO 偵測信心門檻 | `0.25` |
 | `--corner_conf` | 角點輸出信心門檻 | `0.6` |
+| `--min_line_support` | H 白線支持度門檻（投影格線須落在影像白線上）；低於此標為不可靠 | `0.45` |
 | `--out` | 輸出 JSON 路徑 | `<影像名>_corners.json` |
 | `--viz` | 視覺化疊圖輸出路徑（可選） | 不輸出 |
 | `--dark_lines` | 球場線為暗色時加此旗標（少見） | 關閉 |
@@ -115,6 +116,13 @@ python court_corner_gui.py
 
 ## 設計說明
 
+- **白線支持驗證（`stages/line_support.py`）**：求得 H 後，把球場真實格線（48 條邊、
+  省略中段中線）投影回影像，沿每條線量測是否真有白線證據（亮脊：中心比兩側亮、且
+  white-tophat 響應夠強；暗線球場則反向）。整體支持度 [0,1] 會折入信心、低於門檻
+  （`--min_line_support`，預設 0.45）即標記為不可靠，並用於雙球場時只取「有支持」的
+  第 1 座。**注意**：線支持是「必要非充分」——羽球場平行線多，錯位對應仍可能踩到真
+  白線而通過；且 D2 對稱翻轉的格線落在同一批線、支持度相同，無法藉此分辨翻轉。
+
 - **線為主求 H（內嵌移植）**：原 `court_homography_tool.py`（+`folder_yolo_tool.py`）
   的非 GUI 演算法已直接移植到 `court_corner/homography/`（`solver.py` 與
   `court_lines.py`），不再外部引用那兩支檔案。其 node 點為白線交點（次像素）、以
@@ -153,6 +161,7 @@ court_corner_tool/
       __init__.py
       detection.py             第一階段：JunctionDetector
       topology_line.py         第二階段：橋接 homography 求解器（線為主求 H）
+      line_support.py          H 白線支持度驗證（投影格線是否落在影像白線上）
       corners.py               第三階段：CornerGenerator（H 投影 + Steger 精修）
       quality.py               第四階段：QualityEvaluator（幾何 + 影像證據）
     homography/                線為主求解器（移植自原工具，去除 GUI）
