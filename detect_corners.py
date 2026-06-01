@@ -115,6 +115,14 @@ def main(argv=None):
     else:
         print(f"  （無角點通過門檻 conf≥{args.corner_conf}）")
     print(f"狀態：{result.message}")
+    if result.status == "ok":
+        st = result.stage_times or {}
+        brk = "  ".join(f"{k}={v:.2f}s" for k, v in st.items())
+        print(f"處理時間：{result.elapsed_s:.2f}s" + (f"（{brk}）" if brk else ""))
+        hg = result._homography_dict()
+        if "line_support" in hg:
+            ok = "" if hg.get("line_support_ok", True) else "（⚠ 不足，H 可能不可靠）"
+            print(f"H 信心：{result.confidence}　白線支持：{hg['line_support']:.2f}{ok}")
 
     # 寫 JSON
     out_path = args.out or os.path.splitext(args.img_path)[0] + "_corners.json"
