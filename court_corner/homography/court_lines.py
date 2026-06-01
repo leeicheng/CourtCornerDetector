@@ -12,6 +12,8 @@ from typing import Dict, List, Tuple, Optional
 import cv2
 import numpy as np
 
+from ..shared.junction_refine import refine_box as _refine_box_local
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 # ──────────────────────────────────────────────
@@ -238,11 +240,37 @@ def _half_segment_support(pa, pb, ridge_xy, *, frac=0.55, lat_tol=2.5,
     return (len(np.unique(bins)) / nb) >= min_cover
 
 
+def _filter_lines_by_bbox(lines, anns, *, min_support=2):
+    """參考 YOLO 交點框位置選線：真球場線必連接已偵測之交點、會穿過交點框；
+    柱子／人／器材所成之假線則否。對每條線計算「中心落在該線上（垂距 ≤ 該框容差）
+    的交點框數」為支持度，保留支持度 ≥ min_support 者；過濾後不足 4 條時逐步放寬，
+    以免過度刪除。支持度記於每條線之 'bbox_support'。"""
+    if not anns or not lines:
+        return lines
+    cx = np.array([a.bbox[0] + a.bbox[2] / 2.0 for a in anns], float)
+    cy = np.array([a.bbox[1] + a.bbox[3] / 2.0 for a in anns], float)
+    tol = np.array([max(6.0, 0.6 * min(a.bbox[2], a.bbox[3])) for a in anns], float)
+    for m in lines:
+        vx, vy, x0, y0 = m["Limg"]
+        nx, ny = -vy, vx
+        d = np.abs((cx - x0) * nx + (cy - y0) * ny)
+        m["bbox_support"] = int(np.count_nonzero(d <= tol))
+    order = sorted(lines, key=lambda m: m["bbox_support"], reverse=True)
+    for thr in (max(1, int(min_support)), 1):
+        kept = [m for m in order if m["bbox_support"] >= thr]
+        if len(kept) >= 4:
+            return kept
+    return order if len(order) >= 4 else lines
+
+
 def _compute_court_lines(img_bgr, anns, *, pad_frac=0.06, sigma=1.2,
-                         threshold_pct=0.14, dark=False):
+                         threshold_pct=0.14, dark=False,
+                         bbox_select=True, bbox_min_support=2):
     """在所有 bbox 圍出的大範圍上跑一次 Steger，抽出整條球場線。
     回傳 (lines, ridge_img)，lines 內含 'Limg'（原圖座標的 (vx,vy,x0,y0)），
-    ridge_img 為原圖座標的脊點。"""
+    ridge_img 為原圖座標的脊點。
+    bbox_select=True 時，參考 YOLO 交點框位置選線（_filter_lines_by_bbox）：
+    只保留穿過足夠多交點框之線，濾除柱子／人／器材等非球場結構所成之假線。"""
     if not anns:
         return [], np.zeros((0, 2), dtype=np.float32)
     H, W = img_bgr.shape[:2]
@@ -261,6 +289,8 @@ def _compute_court_lines(img_bgr, anns, *, pad_frac=0.06, sigma=1.2,
     for m in lines:
         m["Limg"] = (float(m["L"][0]), float(m["L"][1]),
                      float(m["L"][2] + RX1), float(m["L"][3] + RY1))
+    if bbox_select:
+        lines = _filter_lines_by_bbox(lines, anns, min_support=bbox_min_support)
     ridge_img = np.asarray(ridge, dtype=np.float32).reshape(-1, 2).copy()
     if len(ridge_img):
         ridge_img[:, 0] += RX1
@@ -268,27 +298,53 @@ def _compute_court_lines(img_bgr, anns, *, pad_frac=0.06, sigma=1.2,
     return lines, ridge_img
 
 
-def _assign_junction_lines(anns, class_names, lines, *, on_line_tol=4.0):
-    """把每個交點掛到最近通過它的（最多 2）條球場線。
-    回傳 nodes：{ann_id, type, pt, lines(索引), axis_lines(Limg), cap}。
-    pt 為兩條入射線的交點（若有 2 條且交點落在 bbox 內），否則 bbox 中心。"""
+def _assign_junction_lines(anns, class_names, lines, *, on_line_tol=4.0,
+                           gray=None, dark=False):
+    """把每個交點掛到最近通過它的（最多 2）條球場線，並決定其精修中心 pt。
+
+    pt（交點中心）之來源，依優先序：
+      (1) 局部 refine_box：於 bbox ROI 內以 Steger 脊點 + 雙臂 RANSAC + TLS 解析求交
+          （court_corner.shared.junction_refine，與使用者驗證過之工具同法；需提供 gray）；
+      (2) 全域線交點：兩條入射球場線之交點（若落在 bbox 內）；
+      (3) bbox 中心。
+    線歸屬（lines / axis_lines）一律取自全域球場線，供 cross-ratio／連線列舉之拓樸使用，
+    與中心估計職責分離。回傳 nodes：{ann_id, type, pt, lines(索引), axis_lines(Limg), cap}。
+    """
     def pt_line_dist(Limg, px, py):
         vx, vy, x0, y0 = Limg
         nx, ny = -vy, vx
         return abs((px - x0) * nx + (py - y0) * ny)
 
+    polarity = "dark" if dark else "light"
     nodes = []
     for a in anns:
-        cx, cy = a.bbox[0] + a.bbox[2] / 2.0, a.bbox[1] + a.bbox[3] / 2.0
+        x, y, w, h = a.bbox[0], a.bbox[1], a.bbox[2], a.bbox[3]
+        cx, cy = x + w / 2.0, y + h / 2.0
         jtype = _infer_junction_type(class_names.get(a.class_id, ""))
         cand = sorted(((pt_line_dist(m["Limg"], cx, cy), li)
                        for li, m in enumerate(lines)), key=lambda t: t[0])
         inc = [li for dpx, li in cand if dpx < on_line_tol][:2]
-        pt = (cx, cy)
-        if len(inc) == 2:
+
+        pt = None
+        # (1) 局部 refine_box（驗證過的逐框法）：H 無關，作為中心主要來源
+        if gray is not None and w > 1 and h > 1:
+            try:
+                rb = _refine_box_local(gray, [x, y, x + w, y + h], polarity=polarity)
+            except Exception:
+                rb = None
+            if rb is not None:
+                ip = rb["refined"]
+                if all(np.isfinite(v) for v in ip):
+                    pt = (float(ip[0]), float(ip[1]))
+        # (2) 全域兩線交點（落在 bbox 內才採用）
+        if pt is None and len(inc) == 2:
             ipt = _line_intersection_simple(lines[inc[0]]["Limg"], lines[inc[1]]["Limg"])
-            if ipt is not None and abs(ipt[0] - cx) < a.bbox[2] and abs(ipt[1] - cy) < a.bbox[3]:
-                pt = ipt
+            if ipt is not None and abs(ipt[0] - cx) < w and abs(ipt[1] - cy) < h:
+                pt = (float(ipt[0]), float(ipt[1]))
+        # (3) 退回 bbox 中心
+        if pt is None:
+            pt = (cx, cy)
+
         nodes.append({"ann_id": a.ann_id, "type": jtype, "pt": pt,
                       "lines": inc,
                       "axis_lines": [lines[k]["Limg"] for k in inc],
@@ -298,9 +354,11 @@ def _assign_junction_lines(anns, class_names, lines, *, on_line_tol=4.0):
 
 def _junction_axes_for_thumbs(img_bgr, anns, class_names, *, dark=False):
     """供縮圖使用：回傳 {ann_id: {'lines':[Limg,...], 'pt':(x,y)}}，
-    其中的雙軸來自全域球場線（原圖座標）。"""
+    其中的雙軸來自全域球場線（原圖座標）、中心由 refine_box 精修。"""
     lines, _ = _compute_court_lines(img_bgr, anns, dark=dark)
-    nodes = _assign_junction_lines(anns, class_names, lines)
+    gray = (cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            if (img_bgr is not None and img_bgr.ndim == 3) else img_bgr)
+    nodes = _assign_junction_lines(anns, class_names, lines, gray=gray, dark=dark)
     return {n["ann_id"]: {"lines": n["axis_lines"], "pt": n["pt"]} for n in nodes}
 
 
@@ -317,7 +375,10 @@ def _global_line_link_graph(img_bgr, anns, class_names, *, pad_frac=0.06,
         threshold_pct=threshold_pct, dark=dark)
     if not lines:
         return [], []
-    nodes = _assign_junction_lines(anns, class_names, lines, on_line_tol=on_line_tol)
+    gray = (cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            if (img_bgr is not None and img_bgr.ndim == 3) else img_bgr)
+    nodes = _assign_junction_lines(anns, class_names, lines, on_line_tol=on_line_tol,
+                                   gray=gray, dark=dark)
 
     # 同一條線上的交點，沿線排序後相鄰相連
     # 每端各自判斷是否有 Steger 線支撐：

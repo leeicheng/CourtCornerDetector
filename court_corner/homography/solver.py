@@ -1066,8 +1066,10 @@ def _solve_quad_prosac(sub_pts, sub_types, pool=None, same_line=None,
 
 
 def _solve_point_prosac(node_pts, node_types, famA, famB, line_members, line_fits, subset, vp=None):
-    """缺線後援：①線交點局部 2×2 種子推 H；②找不到 2×2 → 只在「線上的點」做 RANSAC
-    （共線剪枝）；③連線上的點都不夠才退到全部點盲抽。"""
+    """缺線後援（取樣的點一律限定為「落在球場線上」的線點，不退到全部點盲抽）：
+      ① 線交點局部 2×2 種子推 H（種子取自偵測角點，或兩線之幾何交點，皆為線點）；
+      ② 找不到 2×2 → 只在「線上的點」做 RANSAC（共線剪枝）。
+    線點不足 4 個時回傳 None（寧可失敗，也不以非線點亂湊出幾何擬合合理卻 ID 錯位之 H）。"""
     res = _solve_seeded_prosac(node_pts, node_types, famA, famB, line_members, line_fits, subset, vp=vp)
     if res is not None:
         return res
@@ -1077,7 +1079,7 @@ def _solve_point_prosac(node_pts, node_types, famA, famB, line_members, line_fit
     sub_pts = [node_pts[g] for g in sub]
     sub_types = [node_types[g] for g in sub]
 
-    # 線上的點 + 共線點對（local idx）
+    # 落在球場線上的點 + 共線點對（local idx）
     lined_local, same_line = set(), set()
     for m in line_members:
         ms = [loc[g] for g in m if g in loc]
@@ -1087,15 +1089,11 @@ def _solve_point_prosac(node_pts, node_types, famA, famB, line_members, line_fit
             for b in range(a + 1, len(ms)):
                 same_line.add(frozenset((ms[a], ms[b])))
 
-    # ② 只用線上的點 RANSAC
+    # ② 只用「線上的點」做 RANSAC；線點不足 4 個則失敗，不退到全部點盲抽
     if len(lined_local) >= 4:
-        res = _solve_quad_prosac(sub_pts, sub_types, pool=sorted(lined_local),
-                                 same_line=same_line, method="lined-prosac")
-        if res is not None:
-            return res
-    # ③ 全部點盲抽（共線資訊仍輔助剪枝）
-    return _solve_quad_prosac(sub_pts, sub_types, pool=None,
-                              same_line=same_line, method="blind-prosac")
+        return _solve_quad_prosac(sub_pts, sub_types, pool=sorted(lined_local),
+                                  same_line=same_line, method="lined-prosac")
+    return None
 
 
 def _solve_cross_ratio(famA, famB, line_members, line_fits, node_pts, node_types, vp=None):
@@ -1275,7 +1273,7 @@ def solve_court_homography(node_pts, node_types, line_members, line_fits,
             r["timing"] = tmr; r["complexity"] = {**cx, "n_candidates": len(cands)}
             return r
 
-    # 便宜層沒有高一致性解 → 跑點式後援（種子 2×2 → 線上點 → 盲抽）
+    # 便宜層沒有高一致性解 → 跑點式後援（種子 2×2 → 線上點；一律只用線點、不盲抽）
     if not any(good(c) for c in cands):
         _t = time.perf_counter()
         consider(_solve_point_prosac(node_pts, node_types, famA, famB, line_members,
@@ -1472,7 +1470,9 @@ def courts_from_image(img_bgr, anns, class_names, dark=False):
     lines, _ridge = _compute_court_lines(img_bgr, anns, dark=dark)
     if not lines:
         return [], []
-    assign = _assign_junction_lines(anns, class_names, lines)
+    gray = (cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            if (img_bgr is not None and img_bgr.ndim == 3) else img_bgr)
+    assign = _assign_junction_lines(anns, class_names, lines, gray=gray, dark=dark)
     node_pts   = [tuple(n["pt"]) for n in assign]
     node_types = [n["type"] for n in assign]
     node_lines = [list(n["lines"]) for n in assign]
@@ -1538,26 +1538,32 @@ def solve_image(img_bgr, anns, class_names, dark=False, steger_refine=True):
         if not results:
             res = solve_court_homography(npts, ntypes, ct["line_members"],
                                          ct["line_fits"], node_subset=ct["nodes"])
+            _refine_inplace_hungarian(res, npts, ntypes, ct["nodes"], ct["line_members"])
             tm = res.setdefault("timing", {})
             tm["line_extract_ms"] = line_ms; tm["solve_ms"] = solve_ms
             tm["total_ms"] = line_ms + solve_ms
             res["court"] = ci; res["num_nodes"] = len(ct["nodes"]); ci += 1
             out.append(res); continue
         for res in results:
-            ref_ms = relabel_ms = 0.0
+            ref_ms = relabel_ms = hun_ms = 0.0
+            sub = res.get("inlier_nodes") or ct["nodes"]
             if steger_refine and img_bgr is not None:
-                sub = res.get("inlier_nodes") or ct["nodes"]
                 _t = time.perf_counter()
                 _refine_inplace(res, img_bgr, npts, ntypes, sub,
                                 ct["line_members"], dark)
                 ref_ms = (time.perf_counter() - _t) * 1000
+            # 最終精化：用『所有 inlier』以匈牙利演算法配 tid、全部對應重算 H（非僅 4 點）
+            _t = time.perf_counter()
+            _refine_inplace_hungarian(res, npts, ntypes, sub, ct["line_members"])
+            hun_ms = (time.perf_counter() - _t) * 1000
             _t = time.perf_counter()
             _apply_vp_relabel(res, npts, ntypes)
             relabel_ms = (time.perf_counter() - _t) * 1000
             tm = res.setdefault("timing", {})
             tm["line_extract_ms"] = line_ms; tm["solve_ms"] = solve_ms
-            tm["steger_refine_ms"] = ref_ms; tm["vp_relabel_ms"] = relabel_ms
-            tm["total_ms"] = line_ms + solve_ms + ref_ms + relabel_ms
+            tm["steger_refine_ms"] = ref_ms; tm["hungarian_refit_ms"] = hun_ms
+            tm["vp_relabel_ms"] = relabel_ms
+            tm["total_ms"] = line_ms + solve_ms + ref_ms + hun_ms + relabel_ms
             res["court"] = ci; res["num_nodes"] = len(ct["nodes"]); ci += 1
             out.append(res)
     return out
@@ -1590,6 +1596,137 @@ def _apply_vp_relabel(res, node_pts, node_types):
             if d[j] <= thr:
                 inl_ids[i] = idmap.get(cells[j])
         res["inlier_template_ids"] = inl_ids
+
+
+def _fit_rmse(H, node_pts, subset):
+    """子集點對『最近投影模板交點』的反投影 RMSE（與指派/對稱無關，可一致比較不同 H 之擬合品質）。"""
+    try:
+        P = np.array([_proj(H, _tpl_xy(r, c)) for r in range(N_ROW) for c in range(N_COL)], float)
+    except Exception:
+        return 1e9
+    if not np.all(np.isfinite(P)):
+        return 1e9
+    pts = np.array([node_pts[i] for i in subset], float)
+    if len(pts) == 0:
+        return 1e9
+    d = np.sqrt(((pts[:, None, :] - P[None, :, :]) ** 2).sum(2)).min(1)
+    return float(np.sqrt(np.mean(d ** 2)))
+
+
+def _refine_H_hungarian(H, node_pts, node_types, subset, iters=3):
+    """最終精化：以匈牙利演算法（全域最優一對一指派）將 subset 內『所有』inlier 配到
+    30 個模板交點，再用『全部』對應 DLT 重算 H（非僅 4 點）。
+
+    迭代中以反投影 RMSE 追蹤「最佳」H：起點即輸入 H，只有在更佳時才採用並繼續精化，
+    因此回傳之 H 必不差於輸入——用最佳去精化、絕不把較好的結果（如 Steger 已精修者）改差。
+    成本 = 投影距離 + 型別不符懲罰；僅實際距離 ≤ thr 之指派計入內點。
+    回傳 (H_best, n_corr)；n_corr=0 表示沒有比輸入更好的精化（應維持原狀）。scipy 不可用時原樣回傳。
+    """
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except Exception:
+        return np.asarray(H, float), 0
+
+    sub = list(subset) if subset is not None else list(range(len(node_pts)))
+    if len(sub) < 4:
+        return np.asarray(H, float), 0
+    sx = [node_pts[i] for i in sub]
+    span = (math.hypot(max(p[0] for p in sx) - min(p[0] for p in sx),
+                       max(p[1] for p in sx) - min(p[1] for p in sx)) + 1e-6)
+    thr = max(6.0, 0.02 * span)
+    tids = [(r, c) for r in range(N_ROW) for c in range(N_COL)]      # 30 個模板交點
+    BIG = thr * 100.0
+
+    H0 = np.asarray(H, float)
+    best_H = H0
+    best_rmse = _fit_rmse(H0, node_pts, sub)                         # 基準＝輸入 H
+    best_n = 0
+    curH = H0
+    for _ in range(max(1, iters)):
+        proj = [(_proj(curH, _tpl_xy(r, c)), _tpl_type(r, c)) for (r, c) in tids]
+        # 成本矩陣 (len(sub) × 30)
+        cost = np.full((len(sub), len(tids)), BIG, float)
+        for a, di in enumerate(sub):
+            x, y = node_pts[di]
+            t = node_types[di]
+            for b, (pp, tt) in enumerate(proj):
+                if not (math.isfinite(pp[0]) and math.isfinite(pp[1])):
+                    continue
+                d = math.hypot(pp[0] - x, pp[1] - y)
+                if d <= thr * 3:                                    # 太遠者不納入候選
+                    cost[a, b] = d + (0.0 if tt == t else thr)      # 型別不符加懲罰
+        rows, cols = linear_sum_assignment(cost)                    # 全域最優一對一
+        src, dst = [], []
+        for a, b in zip(rows, cols):
+            if cost[a, b] >= BIG:                                   # 未實際配上
+                continue
+            di = sub[a]
+            r, c = tids[b]
+            pp = proj[b][0]
+            if math.hypot(pp[0] - node_pts[di][0], pp[1] - node_pts[di][1]) <= thr:
+                src.append(_tpl_xy(r, c))
+                dst.append(node_pts[di])
+        if len(src) < 4:
+            break
+        try:
+            newH = _dlt(src, dst)                                   # 全部對應重算 H
+        except Exception:
+            break
+        if newH is None or not np.all(np.isfinite(newH)) or not _grid_twist_ok(newH):
+            break
+        new_rmse = _fit_rmse(newH, node_pts, sub)
+        if new_rmse < best_rmse - 1e-9:                             # 只有更佳才採用，並繼續精化
+            converged = np.allclose(newH, curH, atol=1e-6)
+            best_H, best_rmse, best_n = newH, new_rmse, len(src)
+            curH = newH
+            if converged:
+                break
+        else:                                                       # 沒有更佳 → 停（保留目前最佳）
+            break
+    return best_H, best_n
+
+
+def _refine_inplace_hungarian(res, node_pts, node_types, subset, line_members):
+    """最終精化（就地）：以匈牙利演算法配所有 inlier、全部對應重算 H，並『取最佳』——
+    只有當反投影 RMSE 確實變好、且不退化／格子不折疊／線一致性不變差時才採用；
+    否則維持現狀（不會把較好的結果，例如 Steger 已精修者，覆寫成較差）。"""
+    if res is None or res.get("status") != "ok" or res.get("H") is None:
+        return
+    H0 = np.asarray(res["H"], float)
+    H1, ncorr = _refine_H_hungarian(H0, node_pts, node_types, subset)
+    if ncorr < 4 or np.allclose(H1, H0, atol=1e-9):     # 沒有更好的精化 → 不動（保留最佳）
+        return
+    if not _grid_twist_ok(H1):
+        return
+    sx = [node_pts[i] for i in subset]
+    if not sx:
+        return
+    span = (math.hypot(max(p[0] for p in sx) - min(p[0] for p in sx),
+                       max(p[1] for p in sx) - min(p[1] for p in sx)) + 1e-6)
+    cen = (float(np.mean([p[0] for p in sx])), float(np.mean([p[1] for p in sx])))
+    if _h_degenerate(H1, span, cen):
+        return
+    lc0 = _line_consistency(H0, line_members, node_pts, subset)
+    lc1 = _line_consistency(H1, line_members, node_pts, subset)
+    if lc1 < lc0 - 1e-9:                                            # 線一致性變差 → 不採用
+        return
+    if _fit_rmse(H1, node_pts, subset) > _fit_rmse(H0, node_pts, subset) + 1e-6:
+        return                                                     # 反投影 RMSE 變差 → 不採用（取最佳）
+    pts = np.asarray(sx, float)
+    projected = []
+    for r in range(N_ROW):
+        for c in range(N_COL):
+            px = _proj(H1, _tpl_xy(r, c))
+            dmin = (float(np.min(np.hypot(pts[:, 0] - px[0], pts[:, 1] - px[1])))
+                    if len(pts) else 1e9)
+            projected.append({"row": r, "col": c, "type": _tpl_type(r, c),
+                              "xy": [float(px[0]), float(px[1])],
+                              "recovered": dmin > RECOVER_TOL})
+    res["H"] = H1.tolist()
+    res["projected"] = projected
+    res["line_consistency"] = lc1
+    res["method"] = res.get("method", "?") + "+hungarian-refit"
+    res["hungarian_corr"] = ncorr
 
 
 def _refine_inplace(res, img_bgr, node_pts, node_types, subset, line_members, dark):
