@@ -105,7 +105,15 @@ CORNER_CONF_DEFAULT = 0.6          # 預設 corner_conf（最終信心門檻）
 # 白線亮度支持作為遮蔽偵測：角點鄰域確實有亮線→高；被遮蔽/出界→低。
 # 在乾淨合成白線與真實影像皆有效（composite 需紋理，亮度支持不需要）。
 VQ_GEOM_TAU_M = 0.12               # 3× 線寬；重投影誤差的幾何容忍尺度
-VQ_IMG_LINE_WEIGHT = 0.9           # 純亮線（無角點紋理）的影像支持上限
+VQ_IMG_LINE_WEIGHT = 0.9           # （保留；新版 final_conf 直接取 max(vertex, line_support)）
 VQ_TOPO_QUALITY_WEIGHT = {"high": 1.0, "medium": 0.85, "low": 0.7}
 VQ_LINE_SUPPORT_RADIUS_RATIO = 1.5 # 亮度取樣半徑 = ratio × 線寬（下限 4px）
 VQ_LINE_SUPPORT_MIN_RADIUS = 4
+
+# 第四階段三層輸出（strong / weak / hidden）保底規則
+#   strong : final_conf >= corner_conf（幾何 + 影像都夠強，正式輸出）
+#   weak   : 未達 strong，但 H 信心 >= medium 且白線亮度支持 >= 此門檻
+#            → 即使 Harris/Steger 角點響應弱也保留（標 low confidence）
+#   hidden : 其餘（遮蔽 / 白線支持太低 / H 信心 low）→ 不列入 corners，只進 corner_candidates
+VQ_WEAK_LINE_SUPPORT_MIN = 0.45    # weak 保底所需的最低白線亮度支持
+VQ_WEAK_GEOM_QUALITIES = ("high", "medium")   # weak 保底所需的最低 H 信心

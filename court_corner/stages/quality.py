@@ -27,10 +27,13 @@ from ..vertex.reprojection import compute_vertex_reprojection, summarize_reproje
 
 
 class FinalCorner:
-    """最終輸出角點。"""
+    """最終/候選角點。tier ∈ {strong, weak, hidden}；保留各分項分數供診斷。"""
 
     def __init__(self, cid, x, y, conf, junction_idx=-1, corner_type="",
-                 source="", reproj_err_m=None):
+                 source="", reproj_err_m=None, tier="strong",
+                 geom_score=None, vertex_score=None, line_support_score=None,
+                 reject_reason="", x_h=None, y_h=None,
+                 x_refined=None, y_refined=None):
         self.cid = int(cid)
         self.x = float(x)
         self.y = float(y)
@@ -39,13 +42,23 @@ class FinalCorner:
         self.corner_type = corner_type
         self.source = source
         self.reproj_err_m = reproj_err_m
+        self.tier = tier                              # strong / weak / hidden
+        self.geom_score = geom_score                  # g = topo_w × exp(-err/τ)
+        self.vertex_score = vertex_score              # Harris/Steger composite
+        self.line_support_score = line_support_score  # 白線亮度支持
+        self.reject_reason = reject_reason            # tier=hidden 時的原因
+        self.x_h = x_h                                # H 投影位置
+        self.y_h = y_h
+        self.x_refined = x_refined                    # Steger 精修位置（無則 None）
+        self.y_refined = y_refined
 
     def as_tuple(self):
         return (self.cid, self.x, self.y, self.conf)
 
     def as_dict(self):
+        """輸出用（corners）：精簡 + tier。"""
         d = {"cid": self.cid, "x": round(self.x, 3), "y": round(self.y, 3),
-             "conf": round(self.conf, 4)}
+             "conf": round(self.conf, 4), "tier": self.tier}
         if self.junction_idx >= 0:
             d["junction_idx"] = self.junction_idx
         if self.corner_type:
@@ -55,6 +68,26 @@ class FinalCorner:
         if self.reproj_err_m is not None:
             d["reproj_err_m"] = round(float(self.reproj_err_m), 4)
         return d
+
+    def as_breakdown(self):
+        """診斷用（corner_candidates）：完整分項分數與 reject_reason。"""
+        def _r(v, n=3):
+            return None if v is None else round(float(v), n)
+        return {
+            "cid": self.cid,
+            "junction_idx": self.junction_idx,
+            "corner_type": self.corner_type,
+            "tier": self.tier,
+            "source": self.source,
+            "x_h": _r(self.x_h), "y_h": _r(self.y_h),
+            "x_refined": _r(self.x_refined), "y_refined": _r(self.y_refined),
+            "geom_score": _r(self.geom_score, 4),
+            "vertex_score": _r(self.vertex_score, 4),
+            "line_support_score": _r(self.line_support_score, 4),
+            "final_conf": round(self.conf, 4),
+            "reproj_err_m": _r(self.reproj_err_m, 4),
+            "reject_reason": self.reject_reason,
+        }
 
 
 class QualityEvaluator:
@@ -82,6 +115,8 @@ class QualityEvaluator:
         self.topo_quality_weight = dict(config.VQ_TOPO_QUALITY_WEIGHT)
         self.line_support_ratio = config.VQ_LINE_SUPPORT_RADIUS_RATIO
         self.line_support_min_r = config.VQ_LINE_SUPPORT_MIN_RADIUS
+        self.weak_line_support_min = float(config.VQ_WEAK_LINE_SUPPORT_MIN)
+        self.weak_geom_qualities = tuple(config.VQ_WEAK_GEOM_QUALITIES)
         self.scorer = scorer or VertexQualityScorer(
             peak_radius_px=config.VQ_PEAK_RADIUS_PX,
             harris_k=config.VQ_HARRIS_K,
@@ -143,26 +178,28 @@ class QualityEvaluator:
                  H: np.ndarray = None, geom_quality: str = "high",
                  return_all: bool = False):
         """
-        評估角點候選並輸出最終集合。
+        評估角點候選，分三層輸出並附完整候選明細。
 
-        信心融合（同時用幾何與影像證據）：
-            conf = g × image_support
-            g            = topo_quality_weight[geom_quality] × exp(-reproj_err_m / τ_g)
-            image_support = max(VertexQualityScorer.composite,
-                                VQ_IMG_LINE_WEIGHT × 白線亮度支持)
+        分項分數（皆 ∈ [0,1]）：
+            geom_score         = topo_quality_weight[geom_quality] × exp(-reproj_err_m / τ_g)
+            vertex_score       = VertexQualityScorer composite（Harris/Steger 角點響應）
+            line_support_score = 角點鄰域白線亮度支持（遮蔽偵測，不需紋理）
+            final_conf         = geom_score × max(vertex_score, line_support_score)
 
-        Args:
-            img_gray    : 灰階影像
-            candidates  : List[CornerCandidate]（第三階段輸出）
-            H           : Homography（供重投影幾何證據；可省略，省略時 g 取 topo 權重）
-            geom_quality: 第二階段 H 信心（'high'/'medium'/'low'）→ 幾何證據基準
-            return_all  : True 則回傳所有候選（含未過門檻者）
+        三層（strong / weak / hidden）：
+            strong : final_conf >= corner_conf（正式輸出）
+            weak   : 未達 strong，但 geom_quality∈{high,medium} 且 line_support_score >= 門檻
+                     → 保底保留（標 low confidence）；避免「H 合理但 Harris 角點響應弱 → 角點全空」
+            hidden : 其餘（遮蔽 / 白線支持太低 / H 信心 low）→ 不列入 corners，僅進 corner_candidates
 
         Returns:
-            (final_corners: List[FinalCorner], report: dict)
+            (corners, report)
+              corners            : strong + weak（return_all=True 時為全部候選含 hidden）
+              report['corner_candidates'] : 全部候選的分項分數明細（含 hidden 與 reject_reason）
         """
         img_shape = img_gray.shape
         topo_w = self.topo_quality_weight.get(geom_quality, 1.0)
+        geom_ok = geom_quality in self.weak_geom_qualities      # 保底條件之一
 
         # 幾何證據：批次重投影誤差（以 cid 對照）
         reproj_by_cid = {}
@@ -172,54 +209,86 @@ class QualityEvaluator:
             for r in recs:
                 reproj_by_cid[int(r.get("corner_code", -1))] = r["err_m"]
 
-        scored: List[FinalCorner] = []
+        allc: List[FinalCorner] = []
         for c in candidates:
             x0, y0, x1, y1 = self._roi_for(c.pos_px, c.width_px, img_shape)
             roi = img_gray[y0:y1, x0:x1]
 
-            # 影像證據 1：Harris/Steger 角點 composite（真實影像紋理較有效）
+            # 影像證據 1：Harris/Steger 角點 composite
             if roi.size == 0 or roi.shape[0] < 7 or roi.shape[1] < 7:
-                composite = 0.0
+                vertex_score = 0.0
             else:
                 res = self.scorer.evaluate_vertex(
                     (float(c.pos_px[0]), float(c.pos_px[1])), roi, (x0, y0))
-                composite = float(res.composite)
-            # 影像證據 2：白線亮度支持（遮蔽偵測；合成與真實皆有效）
-            line_sup = self._line_support(img_gray, c.pos_px, c.width_px, roi)
-            image_support = max(composite, self.img_line_weight * line_sup)
+                vertex_score = float(res.composite)
+            # 影像證據 2：白線亮度支持（遮蔽偵測）
+            line_support_score = self._line_support(img_gray, c.pos_px, c.width_px, roi)
+            image_support = max(vertex_score, line_support_score)
 
             # 幾何證據
             err_m = reproj_by_cid.get(c.corner_code)
-            if err_m is None:
-                g = topo_w
+            g = topo_w if err_m is None else \
+                topo_w * float(np.exp(-float(err_m) / max(self.geom_tau_m, 1e-6)))
+
+            final_conf = float(np.clip(g * image_support, 0.0, 1.0))
+
+            # 分層 + reject_reason
+            if final_conf >= self.corner_conf:
+                tier, reason = "strong", ""
+            elif geom_ok and line_support_score >= self.weak_line_support_min:
+                tier, reason = "weak", (
+                    f"保底：H信心={geom_quality}、線支持={line_support_score:.2f}≥"
+                    f"{self.weak_line_support_min}，但 final_conf {final_conf:.2f}<{self.corner_conf}")
             else:
-                g = topo_w * float(np.exp(-float(err_m) / max(self.geom_tau_m, 1e-6)))
+                tier = "hidden"
+                rs = []
+                if not geom_ok:
+                    rs.append(f"H信心={geom_quality}(<medium，不保底)")
+                if line_support_score < self.weak_line_support_min:
+                    rs.append(f"線支持 {line_support_score:.2f}<{self.weak_line_support_min}(疑遮蔽/出界)")
+                if vertex_score < 0.3:
+                    rs.append(f"角點響應 {vertex_score:.2f} 低")
+                reason = "；".join(rs) or f"final_conf {final_conf:.2f}<{self.corner_conf}"
 
-            conf = float(np.clip(g * image_support, 0.0, 1.0))
-            scored.append(FinalCorner(
+            h_xy = getattr(c, "h_pos_px", c.pos_px)
+            refined = (c.source != "h_only")
+            allc.append(FinalCorner(
                 cid=c.corner_code, x=float(c.pos_px[0]), y=float(c.pos_px[1]),
-                conf=conf, junction_idx=c.junction_idx, corner_type=c.corner_type,
-                source=c.source, reproj_err_m=err_m))
+                conf=final_conf, junction_idx=c.junction_idx, corner_type=c.corner_type,
+                source=c.source, reproj_err_m=err_m, tier=tier,
+                geom_score=g, vertex_score=vertex_score, line_support_score=line_support_score,
+                reject_reason=reason,
+                x_h=float(h_xy[0]), y_h=float(h_xy[1]),
+                x_refined=(float(c.pos_px[0]) if refined else None),
+                y_refined=(float(c.pos_px[1]) if refined else None)))
 
-        kept = [fc for fc in scored if fc.conf >= self.corner_conf]
-        kept.sort(key=lambda fc: (-fc.conf, fc.cid))
+        strong = [fc for fc in allc if fc.tier == "strong"]
+        weak = [fc for fc in allc if fc.tier == "weak"]
+        hidden = [fc for fc in allc if fc.tier == "hidden"]
+        output = strong + weak
+        output.sort(key=lambda fc: (0 if fc.tier == "strong" else 1, -fc.conf, fc.cid))
 
         report = {
             "n_candidates": len(candidates),
-            "n_passed": len(kept),
+            "n_strong": len(strong),
+            "n_weak": len(weak),
+            "n_hidden": len(hidden),
+            "n_passed": len(output),               # strong + weak（向後相容欄位）
             "corner_conf": self.corner_conf,
             "geom_quality": geom_quality,
-            "mean_conf_passed": (round(float(np.mean([fc.conf for fc in kept])), 4)
-                                 if kept else 0.0),
+            "mean_conf_passed": (round(float(np.mean([fc.conf for fc in output])), 4)
+                                 if output else 0.0),
+            "corner_candidates": [fc.as_breakdown() for fc in
+                                  sorted(allc, key=lambda fc: (fc.cid,))],
         }
         if reproj_by_cid:
-            errs = [v for v in reproj_by_cid.values()]
+            errs = list(reproj_by_cid.values())
             report["reproj_err_m"] = {
                 "mean": round(float(np.mean(errs)), 4),
                 "max": round(float(np.max(errs)), 4),
             }
 
-        return (scored if return_all else kept), report
+        return (allc if return_all else output), report
 
 
 __all__ = ["QualityEvaluator", "FinalCorner"]

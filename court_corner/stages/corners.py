@@ -31,11 +31,13 @@ class CornerCandidate:
     """單一角點候選。"""
 
     def __init__(self, corner_code, junction_idx, corner_type, pos_px,
-                 width_px, source, prelim_conf):
+                 width_px, source, prelim_conf, h_pos_px=None):
         self.corner_code = int(corner_code)      # cid
         self.junction_idx = int(junction_idx)
         self.corner_type = corner_type           # '++'/'+-'/'-+'/'--'
-        self.pos_px = np.asarray(pos_px, dtype=np.float32)
+        self.pos_px = np.asarray(pos_px, dtype=np.float32)        # 最終位置（精修後若有）
+        self.h_pos_px = np.asarray(h_pos_px if h_pos_px is not None else pos_px,
+                                   dtype=np.float32)               # H 投影位置（永遠保留）
         self.width_px = float(width_px)
         self.source = source                     # 'fused'|'h_replaced'|'h_only'
         self.prelim_conf = float(prelim_conf)
@@ -142,7 +144,8 @@ class CornerGenerator:
                     prelim = 0.3   # 純幾何，待第四階段以影像證據確認
                 out.append(CornerCandidate(
                     corner_code=cc, junction_idx=junction_idx, corner_type=ct,
-                    pos_px=pos, width_px=width_px, source=src, prelim_conf=prelim))
+                    pos_px=pos, width_px=width_px, source=src, prelim_conf=prelim,
+                    h_pos_px=v_h))
 
         # 去重：同 cid 可能由不同 junction 重複生成（理論上不會，但保險），保留信心高者
         best = {}

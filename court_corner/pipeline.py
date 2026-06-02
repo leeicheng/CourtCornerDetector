@@ -66,6 +66,8 @@ class PipelineResult:
         return {"method": self.method, "confidence": self.confidence}
 
     def to_dict(self):
+        rep = dict(self.report)
+        candidates = rep.pop("corner_candidates", [])   # 提到頂層,與 corners 並列
         return {
             "status": self.status,
             "message": self.message,
@@ -74,8 +76,9 @@ class PipelineResult:
             "H": (self.H.tolist() if self.H is not None else None),
             "n_detections": (len(self.detection) if self.detection else 0),
             "homography": self._homography_dict(),
-            "report": self.report,
+            "report": rep,
             "corners": [c.as_dict() for c in self.corners],
+            "corner_candidates": candidates,
         }
 
 
@@ -186,8 +189,10 @@ class CourtCornerPipeline:
         out.report = report
         out.status = "ok"
         out.elapsed_s = time.perf_counter() - t0
-        out.message = (f"完成：輸出 {len(corners)} 個角點"
-                       f"（候選 {report['n_candidates']}，門檻 conf≥{report['corner_conf']}）")
+        out.message = (f"完成：輸出 {len(corners)} 個角點 "
+                       f"（strong {report['n_strong']} + weak {report['n_weak']}，"
+                       f"hidden {report['n_hidden']}；候選 {report['n_candidates']}，"
+                       f"門檻 conf≥{report['corner_conf']}）")
         self._log("[Stage4]", out.message,
                   f"｜處理時間 {out.elapsed_s:.2f}s")
         return out

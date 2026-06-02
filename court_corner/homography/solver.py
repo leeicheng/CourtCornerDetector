@@ -1598,29 +1598,12 @@ def _apply_vp_relabel(res, node_pts, node_types):
         res["inlier_template_ids"] = inl_ids
 
 
-def _fit_rmse(H, node_pts, subset):
-    """子集點對『最近投影模板交點』的反投影 RMSE（與指派/對稱無關，可一致比較不同 H 之擬合品質）。"""
-    try:
-        P = np.array([_proj(H, _tpl_xy(r, c)) for r in range(N_ROW) for c in range(N_COL)], float)
-    except Exception:
-        return 1e9
-    if not np.all(np.isfinite(P)):
-        return 1e9
-    pts = np.array([node_pts[i] for i in subset], float)
-    if len(pts) == 0:
-        return 1e9
-    d = np.sqrt(((pts[:, None, :] - P[None, :, :]) ** 2).sum(2)).min(1)
-    return float(np.sqrt(np.mean(d ** 2)))
-
-
 def _refine_H_hungarian(H, node_pts, node_types, subset, iters=3):
     """最終精化：以匈牙利演算法（全域最優一對一指派）將 subset 內『所有』inlier 配到
-    30 個模板交點，再用『全部』對應 DLT 重算 H（非僅 4 點）。
+    30 個模板交點，再用『全部』對應 DLT 重算 H（非僅 4 點），迭代至 H 穩定。
 
-    迭代中以反投影 RMSE 追蹤「最佳」H：起點即輸入 H，只有在更佳時才採用並繼續精化，
-    因此回傳之 H 必不差於輸入——用最佳去精化、絕不把較好的結果（如 Steger 已精修者）改差。
-    成本 = 投影距離 + 型別不符懲罰；僅實際距離 ≤ thr 之指派計入內點。
-    回傳 (H_best, n_corr)；n_corr=0 表示沒有比輸入更好的精化（應維持原狀）。scipy 不可用時原樣回傳。
+    成本 = 投影距離 + 型別不符懲罰（與貪婪 NN 同一成本，但此處求全域最小總成本而非逐一貪婪）；
+    僅實際距離 ≤ thr 之指派計入內點。回傳 (H_refined, n_corr)。scipy 不可用時原樣回傳。
     """
     try:
         from scipy.optimize import linear_sum_assignment
@@ -1637,11 +1620,8 @@ def _refine_H_hungarian(H, node_pts, node_types, subset, iters=3):
     tids = [(r, c) for r in range(N_ROW) for c in range(N_COL)]      # 30 個模板交點
     BIG = thr * 100.0
 
-    H0 = np.asarray(H, float)
-    best_H = H0
-    best_rmse = _fit_rmse(H0, node_pts, sub)                         # 基準＝輸入 H
-    best_n = 0
-    curH = H0
+    curH = np.asarray(H, float)
+    n_best = 0
     for _ in range(max(1, iters)):
         proj = [(_proj(curH, _tpl_xy(r, c)), _tpl_type(r, c)) for (r, c) in tids]
         # 成本矩陣 (len(sub) × 30)
@@ -1674,29 +1654,22 @@ def _refine_H_hungarian(H, node_pts, node_types, subset, iters=3):
             break
         if newH is None or not np.all(np.isfinite(newH)) or not _grid_twist_ok(newH):
             break
-        new_rmse = _fit_rmse(newH, node_pts, sub)
-        if new_rmse < best_rmse - 1e-9:                             # 只有更佳才採用，並繼續精化
-            converged = np.allclose(newH, curH, atol=1e-6)
-            best_H, best_rmse, best_n = newH, new_rmse, len(src)
+        n_best = len(src)
+        if np.allclose(newH, curH, atol=1e-6):                      # 已收斂
             curH = newH
-            if converged:
-                break
-        else:                                                       # 沒有更佳 → 停（保留目前最佳）
             break
-    return best_H, best_n
+        curH = newH
+    return curH, n_best
 
 
 def _refine_inplace_hungarian(res, node_pts, node_types, subset, line_members):
-    """最終精化（就地）：以匈牙利演算法配所有 inlier、全部對應重算 H，並『取最佳』——
-    只有當反投影 RMSE 確實變好、且不退化／格子不折疊／線一致性不變差時才採用；
-    否則維持現狀（不會把較好的結果，例如 Steger 已精修者，覆寫成較差）。"""
+    """最終精化（就地）：以匈牙利演算法配所有 inlier 之 tid、全部對應重算 H。
+    只在不退化、格子不折疊、線一致性不變差時採用；並更新 res 的 H/projected。"""
     if res is None or res.get("status") != "ok" or res.get("H") is None:
         return
     H0 = np.asarray(res["H"], float)
     H1, ncorr = _refine_H_hungarian(H0, node_pts, node_types, subset)
-    if ncorr < 4 or np.allclose(H1, H0, atol=1e-9):     # 沒有更好的精化 → 不動（保留最佳）
-        return
-    if not _grid_twist_ok(H1):
+    if ncorr < 4 or not _grid_twist_ok(H1):
         return
     sx = [node_pts[i] for i in subset]
     if not sx:
@@ -1710,8 +1683,6 @@ def _refine_inplace_hungarian(res, node_pts, node_types, subset, line_members):
     lc1 = _line_consistency(H1, line_members, node_pts, subset)
     if lc1 < lc0 - 1e-9:                                            # 線一致性變差 → 不採用
         return
-    if _fit_rmse(H1, node_pts, subset) > _fit_rmse(H0, node_pts, subset) + 1e-6:
-        return                                                     # 反投影 RMSE 變差 → 不採用（取最佳）
     pts = np.asarray(sx, float)
     projected = []
     for r in range(N_ROW):
