@@ -44,6 +44,24 @@ S2_MIN_INLIERS = 6                # 接受 H 的最少 inlier 數
 S2_STEGER_REFINE_H = True         # 是否對 H 做 Jacobian 導引 Steger 次像素精修
 S2_STEGER_REFINE_ITERS = 2
 
+# Stage 2 — 線為主求解的多階段重試（line_consistency / 白線支持過低時逐步升級）
+#   Attempt 1 strict  ：目前預設抽線
+#   Attempt 2 relaxed ：放寬 Steger 閾值 / 降門檻 / 加 RANSAC 迭代 / 放寬合併
+#   Attempt 3 masked  ：YOLO 交點凸包外擴遮罩內抽線（去除柱子/人/觀眾等干擾結構）
+#   Attempt 4 rerank  ：跨所有嘗試保留 white-line support 前 K 個候選，重排挑最佳
+#   Attempt 5 fail    ：只有當最佳候選 線/型/白線支持 全部低於底線才算徹底失敗
+S2_RETRY_ENABLED = True
+S2_RETRY_LC_OK = 0.5               # line_consistency 達此值且白線支持足 → 視為穩，提前結束重試
+S2_RELAXED_LINE_PARAMS = {
+    "threshold_pct": 0.08, "min_inliers": 20, "min_span": 22.0,
+    "merge_ang_deg": 6.0, "merge_rho": 8.0, "max_iter": 120, "line_thr": 2.5,
+}
+S2_MASK_DILATE_RATIO = 1.0         # 遮罩外擴半徑 = ratio × 中位交點框邊長
+S2_TOPK_CANDIDATES = 8             # 重排保留的候選數
+S2_FAIL_SUPPORT_FLOOR = 0.20       # 徹底失敗底線：白線支持
+S2_FAIL_LC_FLOOR = 0.30            # 徹底失敗底線：line_consistency
+S2_FAIL_TC_FLOOR = 0.50            # 徹底失敗底線：type_consistency
+
 # ──────────────────────────────────────────────────────────────
 # Stage 3 — 角點生成：Steger 中線偏移搜尋
 # ──────────────────────────────────────────────────────────────

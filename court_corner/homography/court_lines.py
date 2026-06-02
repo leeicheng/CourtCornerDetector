@@ -50,7 +50,9 @@ def _steger_ridge_points_simple(
     sigma: float = 1.2,
     threshold_pct: float = 0.18,
     bright_lines: bool = True,
+    mask: np.ndarray = None,
 ) -> np.ndarray:
+    """Steger 次像素脊點。mask(同 roi 尺寸,非 0 處才接受脊點)用於 YOLO 導引的動態遮罩抽線。"""
     if roi_gray is None or roi_gray.size == 0:
         return np.zeros((0, 2), dtype=np.float32)
     g = roi_gray.astype(np.float64)
@@ -73,9 +75,12 @@ def _steger_ridge_points_simple(
         return np.zeros((0, 2), dtype=np.float32)
     thr = threshold_pct * max_strength
     h, w = g.shape[:2]
+    use_mask = mask is not None and mask.shape[:2] == (h, w)
     pts = []
     for y in range(1, h - 1):
         for x in range(1, w - 1):
+            if use_mask and mask[y, x] == 0:
+                continue
             lam = float(ridge_lam[y, x])
             if strength[y, x] < thr:
                 continue
@@ -152,13 +157,13 @@ _TYPE_DEGREE = {"L": 2, "T": 3, "X": 4}
 def _extract_global_court_lines(region_gray, *, sigma=1.2, threshold_pct=0.14,
                                 dark=False, line_thr=2.0, min_inliers=40,
                                 min_span=40.0, merge_ang_deg=4.0, merge_rho=5.0,
-                                max_iter=60, seed=0):
+                                max_iter=60, seed=0, mask=None):
     """在一塊大區域上跑一次 Steger，用多次 RANSAC 抽出整條球場線，
     再依 (方向角, 帶號垂距) 合併重複線。回傳 list of dict
     {L:(vx,vy,x0,y0) 區域座標, n:inlier數, span:線段長}。"""
     pts = _steger_ridge_points_simple(region_gray, sigma=sigma,
                                       threshold_pct=threshold_pct,
-                                      bright_lines=not dark)
+                                      bright_lines=not dark, mask=mask)
     if len(pts) < min_inliers:
         return [], pts
     P = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
@@ -265,14 +270,21 @@ def _filter_lines_by_bbox(lines, anns, *, min_support=2):
 
 def _compute_court_lines(img_bgr, anns, *, pad_frac=0.06, sigma=1.2,
                          threshold_pct=0.14, dark=False,
-                         bbox_select=True, bbox_min_support=2):
+                         bbox_select=True, bbox_min_support=2,
+                         line_params=None, mask=None):
     """在所有 bbox 圍出的大範圍上跑一次 Steger，抽出整條球場線。
     回傳 (lines, ridge_img)，lines 內含 'Limg'（原圖座標的 (vx,vy,x0,y0)），
     ridge_img 為原圖座標的脊點。
     bbox_select=True 時，參考 YOLO 交點框位置選線（_filter_lines_by_bbox）：
-    只保留穿過足夠多交點框之線，濾除柱子／人／器材等非球場結構所成之假線。"""
+    只保留穿過足夠多交點框之線，濾除柱子／人／器材等非球場結構所成之假線。
+    line_params（dict）可覆寫抽線旋鈕（sigma/threshold_pct/line_thr/min_inliers/
+    min_span/merge_ang_deg/merge_rho/max_iter）以做 relaxed 重試；
+    mask（全圖二值，非 None）則只在遮罩內取脊點（YOLO 導引動態遮罩抽線）。"""
     if not anns:
         return [], np.zeros((0, 2), dtype=np.float32)
+    lp = dict(line_params or {})
+    sigma = lp.pop("sigma", sigma)
+    threshold_pct = lp.pop("threshold_pct", threshold_pct)
     H, W = img_bgr.shape[:2]
     xs1 = min(a.bbox[0] for a in anns); ys1 = min(a.bbox[1] for a in anns)
     xs2 = max(a.bbox[0] + a.bbox[2] for a in anns)
@@ -284,8 +296,12 @@ def _compute_court_lines(img_bgr, anns, *, pad_frac=0.06, sigma=1.2,
         return [], np.zeros((0, 2), dtype=np.float32)
     region = cv2.cvtColor(img_bgr[RY1:RY2, RX1:RX2], cv2.COLOR_BGR2GRAY) \
         if img_bgr.ndim == 3 else img_bgr[RY1:RY2, RX1:RX2]
-    lines, ridge = _extract_global_court_lines(region, sigma=sigma,
-                                               threshold_pct=threshold_pct, dark=dark)
+    region_mask = None
+    if mask is not None and mask.shape[:2] == (H, W):
+        region_mask = mask[RY1:RY2, RX1:RX2]
+    lines, ridge = _extract_global_court_lines(
+        region, sigma=sigma, threshold_pct=threshold_pct, dark=dark,
+        mask=region_mask, **lp)
     for m in lines:
         m["Limg"] = (float(m["L"][0]), float(m["L"][1]),
                      float(m["L"][2] + RX1), float(m["L"][3] + RY1))

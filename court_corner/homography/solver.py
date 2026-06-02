@@ -1464,10 +1464,12 @@ def _solve_multi_court(node_pts, node_types, line_members, line_fits, nodes,
     return out
 
 
-def courts_from_image(img_bgr, anns, class_names, dark=False):
+def courts_from_image(img_bgr, anns, class_names, dark=False,
+                      line_params=None, mask=None):
     """回傳 list of court dict：{node_idx, node_pts, node_types, line_members, line_fits}。
     以「共用球場線」連通分量分群。"""
-    lines, _ridge = _compute_court_lines(img_bgr, anns, dark=dark)
+    lines, _ridge = _compute_court_lines(img_bgr, anns, dark=dark,
+                                         line_params=line_params, mask=mask)
     if not lines:
         return [], []
     gray = (cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -1520,12 +1522,14 @@ def courts_from_image(img_bgr, anns, class_names, dark=False):
     return courts, assign
 
 
-def solve_image(img_bgr, anns, class_names, dark=False, steger_refine=True):
+def solve_image(img_bgr, anns, class_names, dark=False, steger_refine=True,
+                line_params=None, mask=None):
     """對整張影像所有球場求 H。每個連通分量先循序多球場擬合（處理兩座被連成一個分量），
     再對每座做 Jacobian 導引的雙軸 Steger 次像素精修出最終 H（不退步才採用）。
     每座結果含 timing（各階段毫秒）與 complexity（節點/線/族/候選 數）。"""
     _t0 = time.perf_counter()
-    courts, _ = courts_from_image(img_bgr, anns, class_names, dark=dark)
+    courts, _ = courts_from_image(img_bgr, anns, class_names, dark=dark,
+                                  line_params=line_params, mask=mask)
     line_ms = (time.perf_counter() - _t0) * 1000        # Steger 全域抽線（通常最重）
     out = []
     ci = 0
