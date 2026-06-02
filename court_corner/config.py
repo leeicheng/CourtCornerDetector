@@ -24,7 +24,7 @@ DIST_L2 = cv2.DIST_L2
 # ──────────────────────────────────────────────────────────────
 # Stage 1 — 交點偵測（YOLO）
 # ──────────────────────────────────────────────────────────────
-YOLO_DEFAULT_CONF = 0.25       # 預設 yolo_conf
+YOLO_DEFAULT_CONF = 0.40       # 預設 yolo_conf
 YOLO_IOU = 0.45                # NMS IoU
 YOLO_MAX_DET = 300
 # class id → junction type；沿用 court_model 的 TYPE 編碼 0=L,1=T,2=X。
