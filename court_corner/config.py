@@ -51,6 +51,8 @@ S2_STEGER_REFINE_ITERS = 2
 #   Attempt 4 rerank  ：跨所有嘗試保留 white-line support 前 K 個候選，重排挑最佳
 #   Attempt 5 fail    ：只有當最佳候選 線/型/白線支持 全部低於底線才算徹底失敗
 S2_RETRY_ENABLED = True
+S2_MASK_DEFAULT = False             # False=Class 1 順序(strict 無遮罩→relaxed→masked 後援，較快且穩)；
+                                    # True=遮罩設預設(strict+mask 起手，僅對乾淨偵測有利，實測對真實資料會變慢變差)
 S2_RETRY_LC_OK = 0.5               # line_consistency 達此值且白線支持足 → 視為穩，提前結束重試
 S2_RELAXED_LINE_PARAMS = {
     "threshold_pct": 0.08, "min_inliers": 20, "min_span": 22.0,

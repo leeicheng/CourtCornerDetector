@@ -47,20 +47,13 @@ class LineSupportScorer:
         self._edges = build_grid_connections()
 
     # ----------------------------------------------------------------
-    @staticmethod
-    def _bilinear(g, x, y):
-        h, w = g.shape
-        if x < 0 or y < 0 or x > w - 1 or y > h - 1:
-            return None
-        x0, y0 = int(x), int(y)
-        x1, y1 = min(x0 + 1, w - 1), min(y0 + 1, h - 1)
-        dx, dy = x - x0, y - y0
-        return float((g[y0, x0] * (1 - dx) + g[y0, x1] * dx) * (1 - dy) +
-                     (g[y1, x0] * (1 - dx) + g[y1, x1] * dx) * dy)
-
-    # ----------------------------------------------------------------
     def score(self, gray: np.ndarray, H: np.ndarray) -> dict:
-        """回傳 {support, n_edges, per_edge:{(a,b):frac}, n_samples}。"""
+        """回傳 {support, n_edges, per_edge:{(a,b):frac}, n_samples}。
+
+        向量化版本：先把所有邊、所有採樣點的 5 組座標（中心 cv、近側 lv/rv、
+        遠側 lf/rf）一次收集成連續陣列，再用單次 cv2.remap 對 gray 與 th
+        進行批次雙線性取樣，最後以 NumPy 布林運算取代逐點 if-else 判斷。
+        """
         if gray.ndim == 3:
             gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
         gray = gray.astype(np.float32)
@@ -77,6 +70,7 @@ class LineSupportScorer:
             th = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, ker)     # 亮線：white-tophat
 
         H = np.asarray(H, dtype=np.float64)
+        m = self.margin
 
         def proj(idx):
             r, c = divmod(idx, N_COL)
@@ -86,15 +80,20 @@ class LineSupportScorer:
                 return None
             return np.array([v[0] / v[2], v[1] / v[2]])
 
-        per_edge = {}
-        sup_list = []
-        n_samp = 0
-        m = self.margin
+        # ── 1) 先把每條邊的採樣點座標收集成連續陣列 ──────────────
+        # 為每條有效邊記錄其在攤平陣列中的 [start, end) 區段，最後再切回。
+        edge_keys = []          # [(a, b), ...]
+        edge_spans = []         # [(start, end), ...]
+        cx_all, cy_all = [], []  # 中心
+        lx_all, ly_all = [], []  # 近側 +n*perp
+        rx_all, ry_all = [], []  # 近側 -n*perp
+        fx_all, fy_all = [], []  # 遠側 +n*far
+        gx_all, gy_all = [], []  # 遠側 -n*far
+        cursor = 0
         for a, b in self._edges:
             pa, pb = proj(a), proj(b)
             if pa is None or pb is None:
                 continue
-            # 兩端都在畫面外（含邊界外緣）則略過
             def outside(p):
                 return p[0] < -m or p[1] < -m or p[0] > w + m or p[1] > h + m
             if outside(pa) and outside(pb):
@@ -105,29 +104,74 @@ class LineSupportScorer:
                 continue
             n = np.array([-d[1], d[0]]) / L
             N = max(6, int(L / 4))
-            hit = 0
-            tot = 0
-            for t in np.linspace(0.08, 0.92, N):
-                p = pa + d * t
-                cv_ = self._bilinear(gray, p[0], p[1])
-                lv = self._bilinear(gray, p[0] + n[0] * perp, p[1] + n[1] * perp)
-                rv = self._bilinear(gray, p[0] - n[0] * perp, p[1] - n[1] * perp)
-                lf = self._bilinear(gray, p[0] + n[0] * far, p[1] + n[1] * far)
-                rf = self._bilinear(gray, p[0] - n[0] * far, p[1] - n[1] * far)
-                tv = self._bilinear(th, p[0], p[1])
-                if None in (cv_, lv, rv, lf, rf, tv):
-                    continue
-                tot += 1
-                bg = float(np.median([lv, rv, lf, rf]))
-                if self.dark:
-                    ridge = (bg - cv_) > self.k_ridge and cv_ <= lv + 1 and cv_ <= rv + 1
-                else:
-                    ridge = (cv_ - bg) > self.k_ridge and cv_ >= lv - 1 and cv_ >= rv - 1
-                if ridge and tv > self.tophat_thresh:
-                    hit += 1
+            ts = np.linspace(0.08, 0.92, N)
+            px = pa[0] + d[0] * ts
+            py = pa[1] + d[1] * ts
+            cx_all.append(px);              cy_all.append(py)
+            lx_all.append(px + n[0] * perp); ly_all.append(py + n[1] * perp)
+            rx_all.append(px - n[0] * perp); ry_all.append(py - n[1] * perp)
+            fx_all.append(px + n[0] * far);  fy_all.append(py + n[1] * far)
+            gx_all.append(px - n[0] * far);  gy_all.append(py - n[1] * far)
+            edge_keys.append((a, b))
+            edge_spans.append((cursor, cursor + N))
+            cursor += N
+
+        if cursor == 0:
+            return {"support": 0.0, "n_edges": 0, "per_edge": {}, "n_samples": 0}
+
+        cx = np.concatenate(cx_all).astype(np.float32)
+        cy = np.concatenate(cy_all).astype(np.float32)
+        lx = np.concatenate(lx_all).astype(np.float32)
+        ly = np.concatenate(ly_all).astype(np.float32)
+        rx = np.concatenate(rx_all).astype(np.float32)
+        ry = np.concatenate(ry_all).astype(np.float32)
+        fx = np.concatenate(fx_all).astype(np.float32)
+        fy = np.concatenate(fy_all).astype(np.float32)
+        gx = np.concatenate(gx_all).astype(np.float32)
+        gy = np.concatenate(gy_all).astype(np.float32)
+
+        # ── 2) 單次 cv2.remap 全局批次取樣（C-level 雙線性） ──────
+        # 把 5 組採樣點水平串接成一張 (1, 5K) 的 map，一次取樣即可。
+        K = cx.shape[0]
+        map_x = np.concatenate([cx, lx, rx, fx, gx]).reshape(1, -1)
+        map_y = np.concatenate([cy, ly, ry, fy, gy]).reshape(1, -1)
+        # 邊界以 NaN 標記（越界視同無效採樣，對應原 _bilinear 回傳 None）
+        sampled_g = cv2.remap(gray, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT,
+                              borderValue=float("nan")).reshape(5, K)
+        sampled_t = cv2.remap(th, map_x[:, :K], map_y[:, :K],
+                              interpolation=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT,
+                              borderValue=float("nan")).reshape(K)
+
+        cv_v = sampled_g[0]
+        lv = sampled_g[1]; rv = sampled_g[2]
+        lf = sampled_g[3]; rf = sampled_g[4]
+        tv = sampled_t
+
+        # 任一採樣越界（NaN）→ 該點無效
+        valid = np.isfinite(cv_v) & np.isfinite(lv) & np.isfinite(rv) \
+            & np.isfinite(lf) & np.isfinite(rf) & np.isfinite(tv)
+
+        bg = np.median(np.stack([lv, rv, lf, rf], axis=0), axis=0)
+        # ── 3) 向量化脊性判斷（取代 if-else） ─────────────────────
+        if self.dark:
+            ridge = ((bg - cv_v) > self.k_ridge) & (cv_v <= lv + 1) & (cv_v <= rv + 1)
+        else:
+            ridge = ((cv_v - bg) > self.k_ridge) & (cv_v >= lv - 1) & (cv_v >= rv - 1)
+        hit_mask = valid & ridge & (tv > self.tophat_thresh)
+
+        # ── 4) 依每條邊的區段切回，計 hit/tot ───────────────────
+        per_edge = {}
+        sup_list = []
+        n_samp = 0
+        for key, (st, en) in zip(edge_keys, edge_spans):
+            vseg = valid[st:en]
+            tot = int(vseg.sum())
             if tot >= self.min_edge_samples:
+                hit = int(hit_mask[st:en].sum())
                 frac = hit / tot
-                per_edge[(a, b)] = frac
+                per_edge[key] = frac
                 sup_list.append(frac)
                 n_samp += tot
         support = float(np.mean(sup_list)) if sup_list else 0.0

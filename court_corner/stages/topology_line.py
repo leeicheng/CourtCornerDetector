@@ -91,6 +91,7 @@ class LineHomographySolver:
         self._scorer = LineSupportScorer(dark=dark)
         # 多階段重試設定
         self.retry_enabled = bool(config.S2_RETRY_ENABLED)
+        self.mask_default = bool(getattr(config, "S2_MASK_DEFAULT", False))
         self.relaxed_params = dict(config.S2_RELAXED_LINE_PARAMS)
         self.retry_lc_ok = float(config.S2_RETRY_LC_OK)
         self.mask_dilate_ratio = float(config.S2_MASK_DILATE_RATIO)
@@ -137,19 +138,38 @@ class LineHomographySolver:
         return base
 
     # ----------------------------------------------------------------
-    def solve(self, img_bgr, anns, class_names) -> LineHomographyResult:
-        """對單張影像求 H（給定 YOLO anns 與 class_names）。"""
+    def solve(self, img_bgr, anns, class_names,
+              cache=None, cache_key=None) -> LineHomographyResult:
+        """對單張影像求 H（給定 YOLO anns 與 class_names）。
+        cache/cache_key 透傳給 solve_image，供 sweep 重跑時跳過抽線+求解。"""
         out = LineHomographyResult()
 
         if not anns or len(anns) < 4:
             out.message = f"交點不足（{len(anns) if anns else 0} < 4），無法求解 H。"
             return out
 
-        # ── 多階段嘗試：strict → relaxed → masked，累積所有 ok 候選 ──
-        attempts = [("strict", None, False)]
-        if self.retry_enabled:
-            attempts.append(("relaxed", self.relaxed_params, False))
-            attempts.append(("masked", self.relaxed_params, True))
+        # 整段 Stage 2 結果快取（含白線重排）：corner_conf sweep（同 min_line_support）直接命中，
+        # 重跑時連 solve_image 與白線支持重排都跳過，真正只剩 Stage 4 filtering。
+        rk = None
+        if cache is not None and cache_key is not None:
+            rk = ("solve_result", cache_key, bool(self.dark),
+                  round(float(self.min_line_support), 4),
+                  bool(self.retry_enabled), bool(self.steger_refine))
+            if rk in cache:
+                return cache[rk]
+
+        # ── 多階段嘗試。預設(mask_default=False)用 Class 1 順序：strict 無遮罩起手最快，
+        #    失敗才放寬，最後才用遮罩當後援(遮罩只在被升級到時才建，早退就不建) ──
+        if self.mask_default:
+            attempts = [("strict+mask", None, True)]
+            if self.retry_enabled:
+                attempts.append(("relaxed+mask", self.relaxed_params, True))
+                attempts.append(("relaxed", self.relaxed_params, False))
+        else:
+            attempts = [("strict", None, False)]
+            if self.retry_enabled:
+                attempts.append(("relaxed", self.relaxed_params, False))
+                attempts.append(("masked", self.relaxed_params, True))
 
         gate = self.min_line_support
         mask = None
@@ -162,7 +182,8 @@ class LineHomographySolver:
             courts = _solver.solve_image(
                 img_bgr, anns, class_names, dark=self.dark,
                 steger_refine=self.steger_refine,
-                line_params=lp, mask=(mask if use_mask else None))
+                line_params=lp, mask=(mask if use_mask else None),
+                cache=cache, cache_key=cache_key)
             for c in (courts or []):
                 if c.get("status") != "ok" or c.get("H") is None:
                     continue
@@ -179,6 +200,8 @@ class LineHomographySolver:
         if not cand:
             out.message = ("線為主求解未得到可靠 H"
                            "（strict / relaxed / masked 皆無候選）。")
+            if rk is not None:
+                cache[rk] = out
             return out
 
         # ── Attempt 4：保留 white-line support 前 K 個候選，再以
@@ -206,6 +229,8 @@ class LineHomographySolver:
             out.attempt = best_d["attempt"]
             out.message = (f"線為主求解所有候選證據皆不足（最佳：線支持={best_sup:.2f}，"
                            f"lc={lc0:.2f}，tc={tc0:.2f}；試 {n_attempts} 階段）。")
+            if rk is not None:
+                cache[rk] = out
             return out
 
         out.attempt = best_d["attempt"]
@@ -252,6 +277,8 @@ class LineHomographySolver:
         out.message = (f"線為主求解成功（嘗試={out.attempt}，method={out.method}，"
                        f"lc={out.line_consistency:.3f}，tc={out.type_consistency:.3f}，"
                        f"線支持={out.line_support:.2f}，交點 {len(junctions)}{tag}）")
+        if rk is not None:
+            cache[rk] = out
         return out
 
 

@@ -130,13 +130,18 @@ class CourtCornerPipeline:
 
     # --------------------------------------------------------------
     def run_image(self, img_bgr: np.ndarray,
-                  detection: Optional[DetectionResult] = None) -> PipelineResult:
+                  detection: Optional[DetectionResult] = None,
+                  cache: Optional[dict] = None,
+                  cache_key: Optional[str] = None) -> PipelineResult:
         """
         對 BGR 影像執行完整管線。
 
         Args:
             img_bgr   : 輸入影像
             detection : 可選，外部已算好的第一階段結果（測試/重跑時可跳過 YOLO）
+            cache     : 可選，呼叫端持有的 dict；連同 cache_key 快取 Stage 2（抽線+求解），
+                        供同一張圖的 sweep（corner_conf / min_line_support 等）重跑時跳過重算
+            cache_key : 快取鍵（通常用影像路徑或唯一 id）
         """
         out = PipelineResult()
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if img_bgr.ndim == 3 else img_bgr
@@ -158,7 +163,8 @@ class CourtCornerPipeline:
         ts = time.perf_counter()
         from .stages.topology_line import detection_to_anns
         anns, class_names = detection_to_anns(detection)
-        line_res = self.line_solver.solve(img_bgr, anns, class_names)
+        line_res = self.line_solver.solve(img_bgr, anns, class_names,
+                                          cache=cache, cache_key=cache_key)
         out.stage_times["solve_H"] = time.perf_counter() - ts
         out.line = line_res
         if line_res.status != "ok" or line_res.H is None:

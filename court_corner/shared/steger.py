@@ -20,7 +20,7 @@ import math
 from typing import List, Optional, Tuple
 
 import numpy as np
-from scipy.ndimage import gaussian_filter
+import cv2
 
 
 # ──────────────────────────────────────────────────────────────
@@ -32,9 +32,14 @@ def _steger_ridge_points_simple(
     threshold_pct: float = 0.15,
     bright_lines: bool = True,
     return_tangents: bool = False,
+    mask: np.ndarray = None,
 ):
     """
     Steger 脊線偵測，回傳次像素脊點。
+
+    統一實作：完全依賴 OpenCV（GaussianBlur + Sobel），不再使用
+    scipy.ndimage.gaussian_filter，以降低卷積成本並消除與 court_lines.py
+    的重複實作。數學與 Steger 1998 Hessian 脊線一致。
 
     Args:
         roi            : 灰階影像 (H, W)，uint8 或 float
@@ -42,6 +47,7 @@ def _steger_ridge_points_simple(
         threshold_pct  : 強度門檻（佔最大強度的「比例」，非百分比；如 0.15）
         bright_lines   : True = 亮線（白線，λ<0）；False = 暗線（λ>0）
         return_tangents: True 則同時回傳切線方向與強度
+        mask           : 同 roi 尺寸，非 0 處才接受脊點（YOLO 導引動態遮罩）
 
     Returns:
         return_tangents=False : pts (N,2) float32，影像座標 (x, y)
@@ -57,12 +63,13 @@ def _steger_ridge_points_simple(
     if g.ndim == 3:
         g = g.mean(axis=2)
 
-    # 高斯導數（scipy order=(axis0=y, axis1=x)）
-    Lx = gaussian_filter(g, sigma, order=(0, 1))
-    Ly = gaussian_filter(g, sigma, order=(1, 0))
-    Lxx = gaussian_filter(g, sigma, order=(0, 2))
-    Lyy = gaussian_filter(g, sigma, order=(2, 0))
-    Lxy = gaussian_filter(g, sigma, order=(1, 1))
+    # 高斯平滑 + Sobel 導數（OpenCV，C-level；取代 scipy gaussian_filter）
+    g = cv2.GaussianBlur(g, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    Lx = cv2.Sobel(g, cv2.CV_64F, 1, 0, ksize=3)
+    Ly = cv2.Sobel(g, cv2.CV_64F, 0, 1, ksize=3)
+    Lxx = cv2.Sobel(g, cv2.CV_64F, 2, 0, ksize=3)
+    Lyy = cv2.Sobel(g, cv2.CV_64F, 0, 2, ksize=3)
+    Lxy = cv2.Sobel(g, cv2.CV_64F, 1, 1, ksize=3)
 
     # Hessian 特徵值（取絕對值較大者為主曲率方向 = 脊線法向）
     tr = Lxx + Lyy
@@ -100,6 +107,8 @@ def _steger_ridge_points_simple(
     sign_ok = (lam < 0) if bright_lines else (lam > 0)
 
     ridge = (np.abs(t) <= 0.5) & (strength > thresh) & sign_ok
+    if mask is not None and mask.shape[:2] == g.shape[:2]:
+        ridge &= (mask > 0)
 
     ys, xs = np.where(ridge)
     if len(ys) == 0:

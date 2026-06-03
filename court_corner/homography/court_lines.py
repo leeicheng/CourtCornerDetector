@@ -13,6 +13,9 @@ import cv2
 import numpy as np
 
 from ..shared.junction_refine import refine_box as _refine_box_local
+# Steger 脊線實作已統一至 shared/steger.py（OpenCV 版）；此處直接引用，
+# 不再保留重複的本地實作，降低維護成本。
+from ..shared.steger import _steger_ridge_points_simple
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -44,69 +47,6 @@ def class_color(cls_id: int) -> Tuple[int,int,int]:
         rng = random.Random(cls_id + 42)
         _COLOR_CACHE[cls_id] = (rng.randint(80,255), rng.randint(80,255), rng.randint(80,255))
     return _COLOR_CACHE[cls_id]
-
-def _steger_ridge_points_simple(
-    roi_gray: np.ndarray,
-    sigma: float = 1.2,
-    threshold_pct: float = 0.18,
-    bright_lines: bool = True,
-    mask: np.ndarray = None,
-) -> np.ndarray:
-    """Steger 次像素脊點。mask(同 roi 尺寸,非 0 處才接受脊點)用於 YOLO 導引的動態遮罩抽線。"""
-    if roi_gray is None or roi_gray.size == 0:
-        return np.zeros((0, 2), dtype=np.float32)
-    g = roi_gray.astype(np.float64)
-    g = cv2.GaussianBlur(g, (0, 0), sigmaX=sigma, sigmaY=sigma)
-    Lx = cv2.Sobel(g, cv2.CV_64F, 1, 0, ksize=3)
-    Ly = cv2.Sobel(g, cv2.CV_64F, 0, 1, ksize=3)
-    Lxx = cv2.Sobel(g, cv2.CV_64F, 2, 0, ksize=3)
-    Lyy = cv2.Sobel(g, cv2.CV_64F, 0, 2, ksize=3)
-    Lxy = cv2.Sobel(g, cv2.CV_64F, 1, 1, ksize=3)
-    trace = Lxx + Lyy
-    diff = Lxx - Lyy
-    root = np.sqrt(np.maximum(0.0, diff * diff + 4.0 * Lxy * Lxy))
-    lam1 = 0.5 * (trace + root)
-    lam2 = 0.5 * (trace - root)
-    use_lam1 = np.abs(lam1) >= np.abs(lam2)
-    ridge_lam = np.where(use_lam1, lam1, lam2)
-    strength = np.abs(ridge_lam)
-    max_strength = float(np.max(strength)) if strength.size else 0.0
-    if max_strength <= 1e-9:
-        return np.zeros((0, 2), dtype=np.float32)
-    thr = threshold_pct * max_strength
-    h, w = g.shape[:2]
-    use_mask = mask is not None and mask.shape[:2] == (h, w)
-    pts = []
-    for y in range(1, h - 1):
-        for x in range(1, w - 1):
-            if use_mask and mask[y, x] == 0:
-                continue
-            lam = float(ridge_lam[y, x])
-            if strength[y, x] < thr:
-                continue
-            if bright_lines and lam >= 0:
-                continue
-            if (not bright_lines) and lam <= 0:
-                continue
-            vx = float(Lxy[y, x])
-            vy = float(lam - Lxx[y, x])
-            nrm = math.hypot(vx, vy)
-            if nrm < 1e-9:
-                vx, vy = 1.0, 0.0
-            else:
-                vx, vy = vx / nrm, vy / nrm
-            gx = float(Lx[y, x])
-            gy = float(Ly[y, x])
-            hnn = float(vx * vx * Lxx[y, x] + 2.0 * vx * vy * Lxy[y, x] + vy * vy * Lyy[y, x])
-            if abs(hnn) < 1e-9:
-                continue
-            t = -float(vx * gx + vy * gy) / hnn
-            if abs(t) <= 0.5:
-                pts.append((x + t * vx, y + t * vy))
-    return np.asarray(pts, dtype=np.float32)
-
-
-
 
 def _line_intersection_simple(line1, line2):
     vx1, vy1, x1, y1 = [float(v) for v in line1[:4]]

@@ -50,6 +50,10 @@ MIN_CORR    = 6       # 最少對應點數
 MIN_COURT_NODES = 6   # 一座球場至少節點數（< 視為碎片/雜訊，不當球場）
 MIN_LC      = 0.5     # 最佳候選的線一致性下限（< 視為不可靠，判失敗而非畫爛 H）
 MIN_TC      = 0.6     # 型別一致性下限（inlier 類型須與投影點類型相符，< 視為 H 錯位/翻轉）
+
+# ── 組合爆炸防護上限（Stage 4 failsafe）──────────────────────
+MAX_LINES_TO_COMBINE = 8     # _label_family 取 4 線組合前的線數硬上限（C(8,4)=70）
+MAX_EVALUATIONS      = 500   # _solve_link_enum 驗證 H 次數的全域上限（超過即中斷）
 RECOVER_TOL = 18.0    # 投影點與偵測點視為同一點的像素容忍
 
 
@@ -139,14 +143,32 @@ def _apply_1d(abc, t):
     return (a * t + b) / den if abs(den) > 1e-9 else 1e18
 
 
-def _label_family(coords, tpl_positions):
+def _label_family(coords, tpl_positions, line_quality_scores=None):
     """把觀測線位置 coords 對到 tpl_positions（容許多餘/雜散線）。
     回傳 (matches{obs_idx->tpl_slot}, residual, n_match)。用 4 錨點 cross-ratio +
-    1D 射影內點計數，全列舉、確定性。"""
+    1D 射影內點計數，全列舉、確定性。
+
+    Stage 4 防爆：在做 4 線組合前，若觀測線數 k 過多，依品質分數（或無分數時
+    依靠近展幅中央程度）取 Top-K（上限 MAX_LINES_TO_COMBINE），把 C(k,4) 鎖在
+    C(8,4)=70 以內，避免雜散線多時組合數指數暴增導致系統假死。"""
     k, m = len(coords), len(tpl_positions)
     if k < MIN_LINES or m < MIN_LINES:
         return {}, float("inf"), 0
     O = list(coords)
+    # orig_idx[i] = O[i] 對應到原始 coords 的索引；截斷後仍以原索引回報 matches
+    orig_idx = list(range(k))
+    if k > MAX_LINES_TO_COMBINE:
+        if line_quality_scores is not None:
+            keep = list(np.argsort(np.asarray(line_quality_scores, float))
+                        [-MAX_LINES_TO_COMBINE:])
+        else:
+            # 無分數：保留最靠近觀測展幅中央的線（端點雜散線最可能是誤抽）
+            mid = 0.5 * (max(O) + min(O))
+            keep = sorted(range(k), key=lambda i: abs(O[i] - mid))[:MAX_LINES_TO_COMBINE]
+        keep = sorted(keep)
+        O = [coords[i] for i in keep]
+        orig_idx = keep
+        k = len(O)
     spread = max(O) - min(O)
     tol = max(1e-6, 0.05 * spread)              # 位置內點容忍（相對展幅）
     best = ({}, float("inf"), 0)
@@ -178,7 +200,8 @@ def _label_family(coords, tpl_positions):
             n = len(matches)
             rr = float(np.mean(res)) if res else float("inf")
             if n > best[2] or (n == best[2] and rr < best[1]):
-                best = (dict(matches), rr, n)
+                # 把局部索引 i 映回原始 coords 索引
+                best = ({orig_idx[i]: j for i, j in matches.items()}, rr, n)
     return best
 
 
@@ -769,61 +792,86 @@ _CAND_BY_TYPE = {nm: [r * N_COL + c for r in range(N_ROW) for c in range(N_COL)
 
 
 def _nn_assign(node_pts, node_types, H, sym, thr, subset=None):
-    """型別懲罰的貪婪 NN 指派（移植自 assign_detections_to_templates_nn）。回傳 inliers, rmse。"""
-    proj = {}
+    """型別懲罰的貪婪 NN 指派（移植自 assign_detections_to_templates_nn）。回傳 inliers, rmse。
+
+    向量化版本：以 NumPy broadcasting 一次算出全部 (節點 × 範本) 的距離矩陣
+    （C-level），取代原本雙層 Python 迴圈 + math.hypot 的逐對計算。"""
+    proj_rc, proj_xy, proj_tt = [], [], []
     for r in range(N_ROW):
         for c in range(N_COL):
             rr, cc = sym(r, c)
             p = _proj(H, _tpl_xy(rr, cc))
             if math.isfinite(p[0]) and math.isfinite(p[1]):
-                proj[(r, c)] = (p, _tpl_type(rr, cc))
-    idxs = subset if subset is not None else range(len(node_pts))
-    pairs = []
-    for di in idxs:
-        pt = node_pts[di]; t = node_types[di]
-        for (rc, (pp, tt)) in proj.items():
-            d = math.hypot(pp[0] - pt[0], pp[1] - pt[1])
-            cost = d + (0.0 if tt == t else thr)      # 型別不符加懲罰
-            if cost <= thr * 3:
-                pairs.append((cost, di, rc, d))
-    pairs.sort()
+                proj_rc.append((r, c))
+                proj_xy.append((p[0], p[1]))
+                proj_tt.append(_tpl_type(rr, cc))
+    idxs = list(subset) if subset is not None else list(range(len(node_pts)))
+    if not proj_xy or not idxs:
+        return [], float("inf")
+
+    P = np.asarray([node_pts[di] for di in idxs], dtype=np.float64)   # (Ni, 2)
+    Q = np.asarray(proj_xy, dtype=np.float64)                         # (Nt, 2)
+    # 距離矩陣 D[i, j] = ||P_i - Q_j||（broadcasting，O(1) Python-level）
+    D = np.sqrt(np.sum((P[:, None, :] - Q[None, :, :]) ** 2, axis=2))  # (Ni, Nt)
+    pt_types = np.asarray([node_types[di] for di in idxs])
+    tp_types = np.asarray(proj_tt)
+    penalty = np.where(pt_types[:, None] == tp_types[None, :], 0.0, thr)
+    cost = D + penalty
+
+    mask = cost <= thr * 3
+    ii, jj = np.nonzero(mask)
+    order = np.argsort(cost[ii, jj], kind="stable")
     used_d, used_t, inl, errs = set(), set(), [], []
-    for cost, di, rc, d in pairs:
+    for k in order:
+        i, j = int(ii[k]), int(jj[k])
+        di = idxs[i]; rc = proj_rc[j]
         if di in used_d or rc in used_t:
             continue
         used_d.add(di); used_t.add(rc)
-        if d <= thr:
-            inl.append(di); errs.append(d)
+        if D[i, j] <= thr:
+            inl.append(di); errs.append(D[i, j])
     rmse = float(np.sqrt(np.mean(np.square(errs)))) if errs else float("inf")
     return inl, rmse
 
 
 def _nn_match(node_pts, node_types, H, sym, thr, subset=None):
-    """同 _nn_assign 的貪婪配對，但回傳每個 inlier 的 (節點idx, 對應範本metric座標, 距離)。"""
-    proj = {}
+    """同 _nn_assign 的貪婪配對，但回傳每個 inlier 的 (節點idx, 對應範本metric座標, 距離)。
+
+    向量化版本：同 _nn_assign 以 broadcasting 算距離矩陣，再貪婪指派。"""
+    proj_rc, proj_xy, proj_mp, proj_tt = [], [], [], []
     for r in range(N_ROW):
         for c in range(N_COL):
             rr, cc = sym(r, c)
             p = _proj(H, _tpl_xy(rr, cc))
             if math.isfinite(p[0]) and math.isfinite(p[1]):
-                proj[(r, c)] = (p, _tpl_xy(rr, cc), _tpl_type(rr, cc))
-    idxs = subset if subset is not None else range(len(node_pts))
-    pairs = []
-    for di in idxs:
-        pt = node_pts[di]; t = node_types[di]
-        for (rc, (pp, mp, tt)) in proj.items():
-            d = math.hypot(pp[0] - pt[0], pp[1] - pt[1])
-            cost = d + (0.0 if tt == t else thr)
-            if cost <= thr * 3:
-                pairs.append((cost, di, rc, mp, d))
-    pairs.sort()
+                proj_rc.append((r, c))
+                proj_xy.append((p[0], p[1]))
+                proj_mp.append(_tpl_xy(rr, cc))
+                proj_tt.append(_tpl_type(rr, cc))
+    idxs = list(subset) if subset is not None else list(range(len(node_pts)))
+    if not proj_xy or not idxs:
+        return []
+
+    P = np.asarray([node_pts[di] for di in idxs], dtype=np.float64)
+    Q = np.asarray(proj_xy, dtype=np.float64)
+    D = np.sqrt(np.sum((P[:, None, :] - Q[None, :, :]) ** 2, axis=2))
+    pt_types = np.asarray([node_types[di] for di in idxs])
+    tp_types = np.asarray(proj_tt)
+    penalty = np.where(pt_types[:, None] == tp_types[None, :], 0.0, thr)
+    cost = D + penalty
+
+    mask = cost <= thr * 3
+    ii, jj = np.nonzero(mask)
+    order = np.argsort(cost[ii, jj], kind="stable")
     used_d, used_t, matches = set(), set(), []
-    for cost, di, rc, mp, d in pairs:
+    for k in order:
+        i, j = int(ii[k]), int(jj[k])
+        di = idxs[i]; rc = proj_rc[j]
         if di in used_d or rc in used_t:
             continue
         used_d.add(di); used_t.add(rc)
-        if d <= thr:
-            matches.append((di, mp, d))
+        if D[i, j] <= thr:
+            matches.append((di, proj_mp[j], float(D[i, j])))
     return matches
 
 
@@ -1013,6 +1061,32 @@ def _solve_quad_prosac(sub_pts, sub_types, pool=None, same_line=None,
                         return False
         return True
 
+    def _gen_valid_tids(cand_lists, img_ccw):
+        """客製化生成器：在指派每個點時即時做共線剪枝，避免把整個
+        itertools.product(*cand_lists) 展開（雜訊多時可達萬級無效組合）。
+        塞入第 idx 個 tid 時，立刻檢查它與已選 tid 是否違反同線約束，
+        違反即放棄該分支（不往下展開）。"""
+        def backtrack(idx, current):
+            if idx == 4:
+                yield tuple(current)
+                return
+            for cand in cand_lists[idx]:
+                if cand in current:           # 4 點需相異
+                    continue
+                valid = True
+                for prev in range(idx):
+                    if frozenset((img_ccw[prev], img_ccw[idx])) in same_line:
+                        ta, tb = current[prev], cand
+                        # 違反共線（既非同列也非同行）→ 剪掉此分支
+                        if ta // N_COL != tb // N_COL and ta % N_COL != tb % N_COL:
+                            valid = False
+                            break
+                if valid:
+                    current.append(cand)
+                    yield from backtrack(idx + 1, current)
+                    current.pop()
+        yield from backtrack(0, [])
+
     best, best_key, attempts = None, (-1, 1.0), 0
     for q in quads:
         pimg = [sub_pts[i] for i in q]
@@ -1025,11 +1099,8 @@ def _solve_quad_prosac(sub_pts, sub_types, pool=None, same_line=None,
         sgn_img = _signed_area([pimg[i] for i in oimg]) > 0
         for sym_name, sym in _SYMS:
             cnt = 0
-            for tids in itertools.product(*cand_lists):
-                if len(set(tids)) < 4:
-                    continue
-                if not _collinear_ok(img_ccw, tids):     # 共線硬剪枝
-                    continue
+            for tids in _gen_valid_tids(cand_lists, img_ccw):
+                # 生成器已保證 4 點相異 + 共線約束，無需再 set/collinear 檢查
                 tpl = [_tpl_xy(*sym(t // N_COL, t % N_COL)) for t in tids]
                 if abs(_signed_area(tpl)) < 0.2:
                     continue
@@ -1184,7 +1255,10 @@ def _solve_link_enum(famA, famB, line_members, line_fits, node_pts, node_types,
     cands.sort(key=lambda c: c[0])
 
     best, best_key = None, (-1, 1.0)
+    evals = 0                       # Stage 4 failsafe：H 驗證次數全域計數
     for _p, Ak, Bk, subA, subB in cands:
+        if evals >= MAX_EVALUATIONS:   # 超過上限強制中斷，寧可判此框架無效也不卡死
+            break
         line_label = {}
         for j, li in enumerate(famA): line_label[li] = (Ak, subA[j])
         for j, li in enumerate(famB): line_label[li] = (Bk, subB[j])
@@ -1193,6 +1267,7 @@ def _solve_link_enum(famA, famB, line_members, line_fits, node_pts, node_types,
         bc = _node_rc_from_labels(line_label, line_members, node_pts, node_types)
         if len(bc) < 5:                       # <5 點 H 不可靠（4 點必過擬合）
             continue
+        evals += 1
         res = _finalize_homography(bc, node_pts, "link-enum", vp=vp)
         if res is None:
             continue
@@ -1522,11 +1597,27 @@ def courts_from_image(img_bgr, anns, class_names, dark=False,
     return courts, assign
 
 
+def _line_params_sig(lp):
+    """把 line_params dict 轉成可雜湊簽名（供快取鍵）。"""
+    if not lp:
+        return None
+    return tuple(sorted((str(k), float(v) if isinstance(v, (int, float)) else v)
+                        for k, v in lp.items()))
+
+
 def solve_image(img_bgr, anns, class_names, dark=False, steger_refine=True,
-                line_params=None, mask=None):
+                line_params=None, mask=None, cache=None, cache_key=None):
     """對整張影像所有球場求 H。每個連通分量先循序多球場擬合（處理兩座被連成一個分量），
     再對每座做 Jacobian 導引的雙軸 Steger 次像素精修出最終 H（不退步才採用）。
-    每座結果含 timing（各階段毫秒）與 complexity（節點/線/族/候選 數）。"""
+    每座結果含 timing（各階段毫秒）與 complexity（節點/線/族/候選 數）。
+    line_params/mask：relaxed 重試 / YOLO 動態遮罩抽線。
+    cache（呼叫端 dict）+ cache_key（通常影像路徑）：快取「抽線+求解」整段，供 sweep 重跑跳過。"""
+    use_cache = cache is not None and cache_key is not None
+    if use_cache:
+        ck = ("solve_image", cache_key, bool(dark), bool(steger_refine),
+              _line_params_sig(line_params), mask is not None)
+        if ck in cache:
+            return cache[ck]
     _t0 = time.perf_counter()
     courts, _ = courts_from_image(img_bgr, anns, class_names, dark=dark,
                                   line_params=line_params, mask=mask)
@@ -1570,6 +1661,8 @@ def solve_image(img_bgr, anns, class_names, dark=False, steger_refine=True,
             tm["total_ms"] = line_ms + solve_ms + ref_ms + hun_ms + relabel_ms
             res["court"] = ci; res["num_nodes"] = len(ct["nodes"]); ci += 1
             out.append(res)
+    if use_cache:
+        cache[ck] = out
     return out
 
 
