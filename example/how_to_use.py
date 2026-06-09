@@ -1,5 +1,3 @@
-from tkinter.scrolledtext import example
-
 from court_corner.pipeline import CourtCornerPipeline
 
 pipe = CourtCornerPipeline("../weight/best.pt", yolo_conf=0.4, corner_conf=0.6)
