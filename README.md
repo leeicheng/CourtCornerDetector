@@ -21,13 +21,24 @@ pip install -r requirements.txt
 
 ## 使用方式
 
+### 函式庫用法
+可參考專案目錄 example 
+```python
+from court_corner.pipeline import CourtCornerPipeline
+
+pipe = CourtCornerPipeline("best.pt", yolo_conf=0.25, corner_conf=0.6)
+result = pipe.run("court.jpg")
+for cid, x, y, conf in result.corners_as_tuples():
+    print(cid, x, y, conf)
+```
+### 指令用法
 ```bash
 python detect_corners.py --img_path court.jpg
 python detect_corners.py --img_path court.jpg --yolo.pt weights/best.pt \
                          --yolo_conf 0.3 --corner_conf 0.6 --viz out.png
 ```
 
-### 指令參數
+#### 指令參數
 
 | 參數 | 說明 | 預設 |
 |------|------|------|
@@ -41,11 +52,81 @@ python detect_corners.py --img_path court.jpg --yolo.pt weights/best.pt \
 | `--dark_lines` | 球場線為暗色時加此旗標（少見） | 關閉 |
 | `--quiet` | 關閉逐階段訊息 | 關閉 |
 
-### 輸出
+#### 輸出
 
 主控台與 JSON 皆輸出最終角點 `(cid, x, y, conf)`，其中 `cid` 為 8-bit 全域
 角點編碼（corner_id）。JSON 另含單應矩陣 `H`、拓樸求解摘要與各角點的
 `junction_idx`、`corner_type`、`source`、`reproj_err_m` 等診斷欄位。
+
+```json
+{
+  "status": "ok",
+  "message": "完成：輸出 34 個角點 （strong 32 + weak 2，hidden 0；候選 34，門檻 conf≥0.6）",
+  "elapsed_s": 1.795,
+  "stage_times": { // 每階段耗時
+    "detect": 1.424,
+    "solve_H": 0.341,
+    "corners": 0.008,
+    "quality": 0.021
+  },
+  "H": [ //找到的 H 矩陣
+    [
+      14.344371639189117,
+      -41.47582440101188,
+      585.0004416401545
+    ],
+    [
+      14.441666257340517,
+      14.263656508534114,
+      -71.55428817553278
+    ],
+    [
+      -0.03982989436837715,
+      -0.03268681975314165,
+      1.0
+    ]
+  ],
+  "n_detections": 12, // 偵測到的交點數
+  "homography": { // H 矩陣拓樸評估
+    "method": "line",
+    "confidence": "high",
+    "line_consistency": 1.0,
+    "type_consistency": 1.0,
+    "line_support": 0.829,
+    "line_support_ok": true,
+    "solver_method": "link-enum+steger-refine+hungarian-refit",
+    "n_steger_refined": 10,
+    "n_courts": 1,
+    "n_junctions": 12
+  },
+  "report": { // 針對該圖的所有統計結果
+    "n_candidates": 34,
+    "n_strong": 32,
+    "n_weak": 2,
+    "n_hidden": 0,
+    "n_passed": 34,
+    "corner_conf": 0.6,
+    "geom_quality": "high",
+    "mean_conf_passed": 0.792,
+    "reproj_err_m": {
+      "mean": 0.0118,
+      "max": 0.0375
+    }
+  },
+  "corners": [ // 角點資訊
+    {
+      "cid": 77,
+      "x": 619.505,
+      "y": 271.861,
+      "conf": 0.9501,
+      "tier": "strong",
+      "junction_idx": 13,
+      "corner_type": "-+",
+      "source": "fused",
+      "reproj_err_m": 0.0027
+    },...]}
+```
+
 
 ## 圖形介面（GUI）
 
@@ -114,36 +195,6 @@ python court_corner_gui.py
   乾淨白線上（無明顯角點紋理）亦可確認其影像存在性。最終以 `corner_conf`
   門檻過濾。
 
-## 設計說明
-
-- **白線支持驗證（`stages/line_support.py`）**：求得 H 後，把球場真實格線（48 條邊、
-  省略中段中線）投影回影像，沿每條線量測是否真有白線證據（亮脊：中心比兩側亮、且
-  white-tophat 響應夠強；暗線球場則反向）。整體支持度 [0,1] 會折入信心、低於門檻
-  （`--min_line_support`，預設 0.45）即標記為不可靠，並用於雙球場時只取「有支持」的
-  第 1 座。**注意**：線支持是「必要非充分」——羽球場平行線多，錯位對應仍可能踩到真
-  白線而通過；且 D2 對稱翻轉的格線落在同一批線、支持度相同，無法藉此分辨翻轉。
-
-- **線為主求 H（內嵌移植）**：原 `court_homography_tool.py`（+`folder_yolo_tool.py`）
-  的非 GUI 演算法已直接移植到 `court_corner/homography/`（`solver.py` 與
-  `court_lines.py`），不再外部引用那兩支檔案。其 node 點為白線交點（次像素）、以
-  cross-ratio 線標號並用 line-consistency 挑解，再 Steger 精修，精度高；移植時僅去除
-  PyQt6 GUI 部分，演算法本身未改動，因此 H 與原工具一致。
-
-- **重新實作 Steger 脊線基元（`shared/steger.py`）**：供 Stage 3 角點精修使用，
-  補回缺漏的 `_steger_ridge_points_simple` 等函式。修正了 Hessian 特徵向量在軸對齊
-  脊線退化的問題（同時計算兩種特徵向量公式並取範數較大者）。
-
-- **信心融合**：原始 `VertexQualityScorer` 的 composite 對「位於脊線上的角點」
-  結構性偏低（差異圖 Harris−Steger 在線上相消），故第四階段改以幾何證據與
-  影像支持相乘，兼顧幾何一致性與遮蔽偵測，輸出更合理之 `[0,1]` 信心值。
-
-- **單張影像的固有方向歧義**：羽球場版面在二面體群 D2（左右翻轉、上下翻轉、
-  180° 旋轉）下型別不變，故型別一致的有效 H 有四個。`court_homography_tool` 以
-  line/type 一致性、vanishing point 與方向慣例（模板 +x→影像右、+y→影像下）來挑選；
-  此歧義為單張影像本質使然。
-
-- **參數來源**：本套件 `config.py` 內各參數為依演算法逆向推得之合理預設，皆已逐項
-  註記，可視實際資料調整。
 
 ## 套件結構
 
@@ -178,19 +229,9 @@ court_corner_tool/
       reprojection.py          角點重投影誤差
     shared/                    場地模型與幾何基元
       __init__.py
-```
       court_model.py           場地模板點位、型別、角點編碼
       homography.py            單應幾何工具
       steger.py                Steger 脊線基元（重新實作補回）
 ```
 
-## 函式庫用法
 
-```python
-from court_corner.pipeline import CourtCornerPipeline
-
-pipe = CourtCornerPipeline("best.pt", yolo_conf=0.25, corner_conf=0.6)
-result = pipe.run("court.jpg")
-for cid, x, y, conf in result.corners_as_tuples():
-    print(cid, x, y, conf)
-```
