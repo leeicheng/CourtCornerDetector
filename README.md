@@ -14,11 +14,6 @@
 ```bash
 pip install -r requirements.txt
 ```
-
-線為主求 H 的演算法（原 `court_homography_tool.py` / `folder_yolo_tool.py` 的非 GUI
-部分）已**直接移植內嵌**於 `court_corner/homography/`，本工具自足、不需另外提供
-那兩支檔案。
-
 ## 使用方式
 
 ### 函式庫用法
@@ -151,9 +146,6 @@ python court_corner_gui.py
   `*_corners.json` 存到指定輸出資料夾。
 - **儲存標註圖** / **儲存 JSON**：輸出目前影像的結果。
 
-模型只在第一次執行時載入一次，之後切換影像或調整參數都沿用同一模型；管線在
-背景執行緒執行，介面不會卡住。
-
 ## 四階段架構
 
 ```
@@ -194,7 +186,6 @@ python court_corner_gui.py
   角點分數」與「白線亮度支持」之較大者——後者作為遮蔽偵測，即使角點壓在
   乾淨白線上（無明顯角點紋理）亦可確認其影像存在性。最終以 `corner_conf`
   門檻過濾。
-
 
 ## 套件結構
 
