@@ -1,34 +1,37 @@
 """
-Vertex Quality Scorer — Harris + Steger + ANMS + Ridge Proximity Filter
-========================================================================
-每個 vertex 給一個連續分數（0~1），不再有 A/B/C/D/F Grade。
-下游自己決定如何聚合或篩選。
+Vertex Quality Scorer — Gradient-Geometry Edition
+==================================================
+每個 vertex 給一個連續分數（0~1）
 
 演算法流程（per ROI）：
-  Stage 1  Harris corner response
-    R = Det(M) − k·Tr(M)²
-  Stage 2  Steger (1998) ridge detector
-    ridge_mask, exclusion_zone, strength (= |lambda_ridge|)
-  Stage 3  Feature-Ridge Diff Map
-    diff = norm(max(R, 0)) − norm(strength)   ∈ [-1, 1]
-      > 0: corner 強於 ridge → 可靠 junction
-      < 0: ridge 強於 corner → 純線段
-  Stage 4  Adaptive NMS (Brown et al. 2005)
-    per-candidate suppression radius r_i = min dist(p_i, p_j) over {j: v_i < c*v_j}
-    取前 top_k 個（空間分佈感知，比固定 NMS 更均勻）
-  Stage 5  Ridge Proximity Filter
-    dist(peak, nearest significant-ridge pixel) ≤ max_dist 才保留
-    （junction 必在白線附近，丟棄背景雜訊）
+  Stage 1  結構張量場
+    Sxx, Syy, Sxy = Gσh * (∇I ∇Iᵀ)
+    harris_R = Det(S) − k·Tr(S)²          （梯度版 Harris, 沿用輸出鍵名）
+    En  = Tr(S) 正規化 ∈ [0,1]            （梯度能量）
+    coh = (λ1−λ2)/(λ1+λ2) ∈ [0,1]         （同調度: 線→1, 角→低）
+  Stage 2  稠密 Förstner 收斂殘差
+    Rn(p) = Σ_w (∇I·(p−x))² / Σ_w |∇I|² / E_rand
+    以矩核摺積一次算整張圖; 真交點處鄰域等照度約束線收斂 → Rn 低
+    ridge 證據 = En·coh（取代 steger_strength）, ridge mask = 高coh∧高能量
+  Stage 3  Feature-Ridge Diff Map（語意同前: >0 corner、<0 line、≈0 背景）
+    diff = clip( min(En/e0,1) · (R0 − Rn)/R0 , −1, 1 ),  R0=0.6, e0=0.15
+    （junction Rn≈0.45 → 正; 線 Rn≈0.76 → 負; 背景低能量 → ≈0）
+  Stage 4  Adaptive NMS (Brown et al. 2005)   —— 不變
+  Stage 5  Gradient Convergence Filter（取代 Ridge Proximity）
+    對每個候選峰在局部窗解 Förstner p*; |p*−peak| ≤ max_dist 且
+    能量支持像素數 ≥ min_area 才保留（峰必須真有梯度線收斂於此）
 
-Vertex Scoring（per vertex, 無 grade）：
+Vertex Scoring（per vertex, 無 grade）—— 公式不變：
   dist_score    = exp(-d / tau)            d = 到最近 final peak 的距離
                                            tau = peak_radius_px
-  heatmap_score = clip(diff[vertex], 0, 1)   負值歸零（ridge-dominant）
+  heatmap_score = clip(diff[vertex], 0, 1)   負值歸零（line-dominant）
   composite     = alpha*dist_score + (1-alpha)*heatmap_score   預設 alpha=0.5
 
 對外介面：evaluate_vertex 方法。
 """
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import cv2
@@ -64,69 +67,86 @@ from ..config import (
 DIST_WEIGHT_DEFAULT    = 0.5   # alpha in composite
 HEATMAP_WEIGHT_DEFAULT = 0.5
 
+_COH_RIDGE_THR = 0.65          # 同調度高於此視為線狀
+_RN_SPLIT      = 0.55          # 收斂殘差分界: junction(≈0.27) < 0.55 ≈ 線中心 (平窗實測)
+_EN_GATE       = 0.15          # 能量門控尺度 (壓低弱梯度背景)
+
 
 # ═══════════════════════════════════════════════════════
-#  Low-level algorithm helpers (ported from uploaded core.py)
+#  Low-level gradient helpers
 # ═══════════════════════════════════════════════════════
 
-def _structure_tensor(gray_f64: np.ndarray, sigma: float):
-    """Gaussian-weighted outer product of grad I. Returns (Ixx, Iyy, Ixy)."""
-    Ix = cv2.Sobel(gray_f64, cv2.CV_64F, 1, 0, ksize=3)
-    Iy = cv2.Sobel(gray_f64, cv2.CV_64F, 0, 1, ksize=3)
-    return (gaussian_filter(Ix * Ix, sigma),
-            gaussian_filter(Iy * Iy, sigma),
-            gaussian_filter(Ix * Iy, sigma))
+def _gradients(gray_f32: np.ndarray, sigma: float):
+    """Gaussian 平滑後的 Sobel 梯度 (Ix, Iy)。sigma = 梯度尺度。"""
+    f = cv2.GaussianBlur(gray_f32, (0, 0), max(float(sigma), 0.3))
+    Ix = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3)
+    Iy = cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3)
+    return Ix, Iy
 
 
-def _harris_R_fn(Ixx, Iyy, Ixy, k):
-    """R = Det(M) - k * Tr(M)^2"""
-    return (Ixx * Iyy - Ixy ** 2 - k * (Ixx + Iyy) ** 2).astype(np.float32)
+def _structure_tensor_field(Ix, Iy, sigma: float):
+    """以 Gσ 平滑的結構張量分量。"""
+    s = max(float(sigma), 0.5)
+    Sxx = gaussian_filter(Ix * Ix, s)
+    Syy = gaussian_filter(Iy * Iy, s)
+    Sxy = gaussian_filter(Ix * Iy, s)
+    return Sxx, Syy, Sxy
+
+
+def _dense_conv_resid(Ix, Iy, win_radius: int):
+    """稠密 Förstner 收斂殘差 (以視窗中心為查詢點), 正規化使隨機梯度 ≈ 1。
+
+    R(p) = Σ_w [Ix²u² + 2·IxIy·uv + Iy²v²] / Σ_w (Ix²+Iy²) / E_rand,
+      其中 (u,v) = x − p, w = (2r+1)² 平窗, E_rand = E[u²+v²]/2。
+    實測 (W=21): junction Rn≈0.27 < 線中心 ≈0.55 < 背景 ≈0.76。
+    """
+    r = max(4, int(win_radius))
+    n1 = 2 * r + 1
+    u = np.arange(-r, r + 1, dtype=np.float32)
+    ones = np.ones(n1, np.float32)
+    u2 = u * u
+    norm = 1.0 / (n1 * n1)
+    e_rand = float(2.0 * n1 * u2.sum()) * norm / 2.0   # = E[u²+v²]/2
+    gxx = Ix * Ix
+    gyy = Iy * Iy
+    gxy = Ix * Iy
+    B = cv2.BORDER_REFLECT
+    # 矩核皆可分離: Ku2 = u²⊗1, Kuv = u⊗v, Kv2 = 1⊗v² (×1/N)
+    num = (cv2.sepFilter2D(gxx, -1, u2, ones, borderType=B)
+           + 2.0 * cv2.sepFilter2D(gxy, -1, u, u, borderType=B)
+           + cv2.sepFilter2D(gyy, -1, ones, u2, borderType=B)) * norm
+    den = cv2.sepFilter2D(gxx + gyy, -1, ones, ones, borderType=B) * norm
+    return (num / (den * e_rand + 1e-9)).astype(np.float32)
+
+
+def _forstner_local(Ix, Iy, cy: int, cx: int, r: int):
+    """在 (cy,cx) 半徑 r 的窗內解 Förstner p*。
+    回傳 (dy, dx, n_support) — p* 相對窗中心的偏移與能量支持數; 無解回傳 None。"""
+    h, w = Ix.shape
+    y0, y1 = max(0, cy - r), min(h, cy + r + 1)
+    x0, x1 = max(0, cx - r), min(w, cx + r + 1)
+    ix = Ix[y0:y1, x0:x1].astype(np.float64)
+    iy = Iy[y0:y1, x0:x1].astype(np.float64)
+    g2 = ix * ix + iy * iy
+    if g2.size == 0:
+        return None
+    n_support = int((g2 > 0.1 * g2.max()).sum()) if g2.max() > 0 else 0
+    yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float64)
+    A11 = float((ix * ix).sum()); A22 = float((iy * iy).sum())
+    A12 = float((ix * iy).sum())
+    det = A11 * A22 - A12 * A12
+    if det <= 1e-9 or (A11 + A22) <= 1e-9:
+        return None
+    b1 = float((ix * ix * xx + ix * iy * yy).sum())
+    b2 = float((ix * iy * xx + iy * iy * yy).sum())
+    px = (A22 * b1 - A12 * b2) / det
+    py = (A11 * b2 - A12 * b1) / det
+    return (py - cy, px - cx, n_support)
 
 
 def _disk_kernel(radius: int) -> np.ndarray:
     y, x = np.ogrid[-radius:radius + 1, -radius:radius + 1]
     return (x ** 2 + y ** 2 <= radius ** 2).astype(np.uint8)
-
-
-def _steger_ridges(gray_u8: np.ndarray, sigma, thr_pct, dil_r, dark):
-    """
-    Steger (1998) ridge detector with sub-pixel verification.
-    Returns (ridge_mask, exclusion_zone, strength, eigenval).
-    """
-    g   = gray_u8.astype(np.float64)
-    Lx  = gaussian_filter(g, sigma, order=(0, 1))
-    Ly  = gaussian_filter(g, sigma, order=(1, 0))
-    Lxx = gaussian_filter(g, sigma, order=(0, 2))
-    Lyy = gaussian_filter(g, sigma, order=(2, 0))
-    Lxy = gaussian_filter(g, sigma, order=(1, 1))
-
-    tr   = Lxx + Lyy
-    disc = np.sqrt(np.maximum(((Lxx - Lyy) / 2) ** 2 + Lxy ** 2, 0.0))
-    lam1 = tr / 2 + disc
-    lam2 = tr / 2 - disc
-    lam  = np.where(np.abs(lam2) > np.abs(lam1), lam2, lam1)
-
-    nx_r = Lxy; ny_r = lam - Lxx
-    nnorm = np.sqrt(nx_r ** 2 + ny_r ** 2) + 1e-12
-    nx, ny = nx_r / nnorm, ny_r / nnorm
-    t = -(Lx * nx + Ly * ny) / (Lxx * nx**2 + 2 * Lxy * nx * ny + Lyy * ny**2 + 1e-12)
-
-    strength = np.abs(lam).astype(np.float32)
-    smax     = float(strength.max()) if strength.max() > 0 else 1.0
-    thresh   = thr_pct / 100.0 * smax
-    sign_ok  = (lam < 0) if dark else (lam > 0)
-    ridge    = (np.abs(t) <= 0.5) & (strength > thresh) & sign_ok
-    excl     = binary_dilation(ridge, structure=_disk_kernel(dil_r)) if dil_r > 0 else ridge.copy()
-    return ridge, excl, strength, lam.astype(np.float32)
-
-
-def _feature_ridge_diff(harris_R: np.ndarray,
-                        steger_strength: np.ndarray) -> np.ndarray:
-    """diff = norm(max(R, 0)) - norm(strength)  in [-1, 1]"""
-    feat  = np.clip(harris_R, 0, None).astype(np.float32)
-    feat  = feat / (feat.max() + 1e-9)
-    ridge = steger_strength / (steger_strength.max() + 1e-9)
-    return (feat - ridge).astype(np.float32)
 
 
 def _topk_anms(diff: np.ndarray, top_k: int,
@@ -166,7 +186,8 @@ def _topk_anms(diff: np.ndarray, top_k: int,
 def _significant_ridge_mask(ridge_mask: np.ndarray,
                             min_component_area: int,
                             closing_radius: int = 3) -> np.ndarray:
-    """Keep only connected components of ridge_mask with area >= threshold."""
+    """Keep only connected components of ridge_mask with area >= threshold.
+    （與舊版相同, 供 sig_ridge_mask 輸出鍵）"""
     rm = ridge_mask.astype(bool)
     if min_component_area <= 1 or not rm.any():
         return rm.copy()
@@ -192,21 +213,22 @@ def _significant_ridge_mask(ridge_mask: np.ndarray,
     return keep[labelled]
 
 
-def _filter_by_ridge_proximity(ys, xs, vals, sig_mask, max_dist):
-    """Drop peaks farther than max_dist from any significant-ridge pixel."""
+def _convergence_filter(ys, xs, vals, Ix, Iy, max_dist, min_support, win_r):
+    """[取代 ridge-proximity] 峰必須有梯度線收斂證據:
+    局部 Förstner p* 與峰距離 ≤ max_dist, 且能量支持數 ≥ min_support。"""
     if len(ys) == 0:
-        e = np.array([], int);  ef = np.array([], float)
+        e = np.array([], int); ef = np.array([], float)
         return e, e, ef, e, e
-    if not sig_mask.any():
-        e = np.array([], int);  ef = np.array([], float)
-        return e, e, ef, ys.copy(), xs.copy()
-
-    dist = distance_transform_edt(~sig_mask.astype(bool))
-    peak_dists = dist[ys, xs]
-    keep = peak_dists <= max_dist
+    keep = np.zeros(len(ys), bool)
+    for i, (y, x) in enumerate(zip(ys, xs)):
+        f = _forstner_local(Ix, Iy, int(y), int(x), win_r)
+        if f is None:
+            continue
+        dy, dx, n_sup = f
+        if math.hypot(dy, dx) <= max_dist and n_sup >= min_support:
+            keep[i] = True
     drop = ~keep
-    return (ys[keep], xs[keep], vals[keep],
-            ys[drop], xs[drop])
+    return (ys[keep], xs[keep], vals[keep], ys[drop], xs[drop])
 
 
 # ═══════════════════════════════════════════════════════
@@ -233,21 +255,30 @@ def run_harris_steger_analysis(
     prox_close_r:   int   = _PROX_CLOSE_R,
 ) -> dict:
     """
-    End-to-end Harris + Steger + ANMS + ridge-proximity pipeline.
+    End-to-end gradient-geometry pipeline.（簽名與回傳鍵與舊版完全相同）
+
+    參數對應（語意換新, 名稱保留以維持相容）:
+      harris_sigma   : 結構張量平滑尺度 + conv_resid 視窗尺度
+      steger_sigma   : 梯度計算前的平滑尺度
+      steger_thr_pct : ridge 證據能量門檻 (%)
+      dark_ridges    : 接受但忽略（梯度對亮暗線對稱）
+      prox_max_dist  : 峰的 Förstner p* 最大允許偏移 (px)
+      prox_min_area  : 峰局部窗內最少能量支持像素數
+      prox_close_r   : 僅用於 sig_ridge_mask 形態學（沿用）
 
     Returns (all arrays padded back to original ROI size):
-      harris_R         : (H,W) float32  Harris response
+      harris_R         : (H,W) float32  結構張量 Harris 響應
       harris_mask      : (H,W) bool     NMS+threshold corners (reference)
       harris_thresh    : float
-      steger_ridge     : (H,W) bool     sub-pixel verified ridge pixels
+      steger_ridge     : (H,W) bool     線狀證據遮罩 (高同調∧高能量)
       steger_excl      : (H,W) bool     dilated exclusion zone
-      steger_strength  : (H,W) float32  |lambda_ridge|
-      steger_eigenval  : (H,W) float32  signed lambda_ridge
+      steger_strength  : (H,W) float32  ridge 證據 = En·coh
+      steger_eigenval  : (H,W) float32  λ1−λ2 (結構張量特徵值差)
       sig_ridge_mask   : (H,W) bool     significant-component ridge mask
-      diff             : (H,W) float32  norm(R) - norm(strength) in [-1, 1]
-      peaks            : list[(row, col)]  FINAL peaks after ANMS + proximity
+      diff             : (H,W) float32  corner−ridge 證據 ∈ [-1, 1]
+      peaks            : list[(row, col)]  FINAL peaks after ANMS + convergence
       peak_vals        : list[float]       diff value at each peak
-      dropped_peaks    : list[(row, col)]  ANMS peaks dropped by proximity
+      dropped_peaks    : list[(row, col)]  peaks dropped by convergence filter
       inset            : int
 
     Backward-compat aliases:
@@ -267,35 +298,56 @@ def run_harris_steger_analysis(
     inset = max(0, min(inset, (min(roi_h, roi_w) - 7) // 2))
     work  = gray_roi[inset:roi_h-inset, inset:roi_w-inset] if inset else gray_roi
     wh, ww = work.shape[:2]
-    wu8   = np.clip(work, 0, 255).astype(np.uint8)
+    wf32  = np.clip(work, 0, 255).astype(np.float32)
 
-    # Stage 1: Harris R
-    Ixx, Iyy, Ixy = _structure_tensor(wu8.astype(np.float64), harris_sigma)
-    R      = _harris_R_fn(Ixx, Iyy, Ixy, harris_k)
-    h_thr  = harris_thr_pct / 100.0 * float(max(R.max(), 1e-9))
-    R_pos  = np.where(R > 0, R, 0.0).astype(np.float32)
-    lm_h   = maximum_filter(R_pos, size=2 * anms_nms_r + 1)
+    # Stage 1: 梯度 + 結構張量場
+    Ix, Iy = _gradients(wf32, steger_sigma)
+    Sxx, Syy, Sxy = _structure_tensor_field(Ix, Iy, harris_sigma)
+    tr_S  = Sxx + Syy
+    det_S = Sxx * Syy - Sxy * Sxy
+    R     = (det_S - harris_k * tr_S * tr_S).astype(np.float32)
+    h_thr = harris_thr_pct / 100.0 * float(max(R.max(), 1e-9))
+    R_pos = np.where(R > 0, R, 0.0).astype(np.float32)
+    lm_h  = maximum_filter(R_pos, size=2 * anms_nms_r + 1)
     h_mask = (R_pos == lm_h) & (R > h_thr)
 
-    # Stage 2: Steger
-    ridge, excl, strength, eigenval = _steger_ridges(
-        wu8, steger_sigma, steger_thr_pct, steger_dil_r, dark_ridges)
+    En  = (tr_S / (float(np.percentile(tr_S, 99)) + 1e-9)).astype(np.float32)
+    disc = np.sqrt(np.maximum((Sxx - Syy) ** 2 + 4.0 * Sxy * Sxy, 0.0))
+    coh  = (disc / (tr_S + 1e-9)).astype(np.float32)          # (λ1−λ2)/(λ1+λ2)
+    eigdiff = disc.astype(np.float32)                          # λ1−λ2
 
-    # Stage 3: diff map
-    diff = _feature_ridge_diff(R, strength)
+    # ridge 證據 (取代 Steger; 供輸出鍵與遮罩, 不參與 diff)
+    strength = (En * coh).astype(np.float32)
+    smax = float(strength.max()) if strength.max() > 0 else 1.0
+    ridge = (coh > _COH_RIDGE_THR) & (strength > steger_thr_pct / 100.0 * smax)
+    excl  = binary_dilation(ridge, structure=_disk_kernel(steger_dil_r)) \
+        if steger_dil_r > 0 else ridge.copy()
 
-    # Stage 4: ANMS peaks
+    # Stage 2: 稠密收斂殘差 (核心判別器)
+    Rn = _dense_conv_resid(Ix, Iy, int(round(7.0 * max(float(harris_sigma), 1.0))))
+
+    # Stage 3: diff map — 能量門控 × 收斂證據 × 非退化性, 維持舊語意
+    #   (>0 corner, <0 line, ≈0 背景)
+    #   (1−coh) 抑制 Förstner 退化: 邊緣上梯度共線 → 約束線退化 → Rn 假性低谷,
+    #   此時 coh→1, 乘上 (1−coh) 將其壓回。junction coh≈0.5 → 保留。
+    en_gate = np.clip(En / _EN_GATE, 0.0, 1.0)
+    nondeg  = np.clip(2.0 * (1.0 - coh), 0.0, 1.0)
+    diff = np.clip(en_gate * nondeg * (_RN_SPLIT - Rn) / _RN_SPLIT,
+                   -1.0, 1.0).astype(np.float32)
+
+    # Stage 4: ANMS peaks（不變）
     ys_a, xs_a, vals_a = _topk_anms(
         diff, top_k=top_k, c=anms_c,
         candidate_pool=anms_pool, loose_nms_radius=anms_nms_r)
 
-    # Stage 5: ridge proximity filter
+    # Stage 5: gradient convergence filter（取代 ridge proximity）
+    sig_mask = _significant_ridge_mask(ridge, prox_min_area, prox_close_r)
     if prox_enabled and len(ys_a) > 0:
-        sig_mask = _significant_ridge_mask(ridge, prox_min_area, prox_close_r)
-        ys_k, xs_k, vals_k, ys_d, xs_d = _filter_by_ridge_proximity(
-            ys_a, xs_a, vals_a, sig_mask, prox_max_dist)
+        win_r = max(3, int(round(3.0 * harris_sigma)))
+        ys_k, xs_k, vals_k, ys_d, xs_d = _convergence_filter(
+            ys_a, xs_a, vals_a, Ix, Iy,
+            max_dist=prox_max_dist, min_support=prox_min_area, win_r=win_r)
     else:
-        sig_mask = np.zeros_like(ridge, dtype=bool)
         ys_k, xs_k, vals_k = ys_a, xs_a, vals_a
         ys_d = np.array([], int);  xs_d = np.array([], int)
 
@@ -318,7 +370,7 @@ def run_harris_steger_analysis(
         steger_ridge    = _pad(ridge, bool),
         steger_excl     = _pad(excl, bool),
         steger_strength = _pad(strength),
-        steger_eigenval = _pad(eigenval),
+        steger_eigenval = _pad(eigdiff),
         sig_ridge_mask  = _pad(sig_mask, bool),
         diff            = diff_padded,
         combined        = diff_padded,      # backward-compat alias
@@ -407,7 +459,7 @@ class PipelineScore:
 
 
 # ═══════════════════════════════════════════════════════
-#  VertexQualityScorer
+#  VertexQualityScorer   —— 介面與公式
 # ═══════════════════════════════════════════════════════
 
 class VertexQualityScorer:
@@ -484,7 +536,7 @@ class VertexQualityScorer:
 
     def evaluate_vertex(self, vertex_pos_px, roi_gray, roi_origin):
         """
-        對單一 vertex 給分（無 grade）。
+        對單一 vertex 給分（無 grade）。（輸入/輸出）
         """
         res = VertexQualityResult()
         if roi_gray is None or roi_gray.size == 0: return res
@@ -527,5 +579,3 @@ class VertexQualityScorer:
         )
         res.composite = float(np.clip(res.composite, 0.0, 1.0))
         return res
-
-
