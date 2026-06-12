@@ -391,6 +391,24 @@ _SYMS = [
     ("flipRC",   lambda r, c: (N_ROW - 1 - r, N_COL - 1 - c)),
 ]
 
+# 掌性（chirality）：物理上可實現的 H（任何位於地板上方的相機、影像 y 向下）
+# 把「模板正向（正有向面積）圖形」投影成影像「負向」圖形，恆定不變
+# （多機位物理相機模型數值驗證）。flipC / flipR 是鏡像重標號，解出的 H
+# 掌性反轉 → 幾何完美貼線（lc/tc/線支持全高分）但所有 cid 左右/上下對調。
+_PROPER_SIGN = -1
+
+
+def _chirality_ok(H) -> bool:
+    """模板 CCW 三角形 (0,0)-(W,0)-(0,L) 投影後的有向面積符號是否合法。"""
+    q0 = _proj(H, (0.0, 0.0))
+    q1 = _proj(H, (COL_X[-1], 0.0))
+    q2 = _proj(H, (0.0, ROW_Y[0]))
+    if not all(math.isfinite(v) for v in (*q0, *q1, *q2)):
+        return False
+    cr = ((q1[0] - q0[0]) * (q2[1] - q0[1])
+          - (q1[1] - q0[1]) * (q2[0] - q0[0]))
+    return (cr < 0) if _PROPER_SIGN < 0 else (cr > 0)
+
 
 def _signed_area(quad):
     x = [p[0] for p in quad]; y = [p[1] for p in quad]
@@ -517,19 +535,58 @@ def _vp_relabel_ids(proj):
         dbg.append(f"VP_long=({vp_long[0]:.0f},{vp_long[1]:.0f}) d0={d0:.0f} d5={d5:.0f}→{'flip_y' if flip_y else 'no flip_y'}")
     else:
         dbg.append("VP_long 不足，flip_y=False")
-    near = (N_ROW - 1) if flip_y else 0
-    nr = [proj.get((near, c)) for c in range(N_COL)]
+    def _make_idmap(fy, fx):
+        m = {}
+        for r in range(N_ROW):
+            for c in range(N_COL):
+                r2 = (N_ROW - 1 - r) if fy else r
+                c2 = (N_COL - 1 - c) if fx else c
+                m[(r, c)] = r2 * N_COL + c2
+        return m
+
+    def _labeling_proper(idmap):
+        """三個跨度大的對應（模板新座標↔影像點）檢查掌性。
+        合法 H 必為模板正向↔影像負向；兩個 flip_x 選項恰一合法。"""
+        cells = [rc for rc in idmap if rc in proj]
+        if len(cells) < 3:
+            return None
+        pts = np.array([proj[rc] for rc in cells], float)
+        i0 = 0
+        i1 = int(np.argmax(np.hypot(pts[:, 0] - pts[i0, 0], pts[:, 1] - pts[i0, 1])))
+        v = pts[i1] - pts[i0]
+        nv = np.array([-v[1], v[0]]); nv /= (math.hypot(*nv) + 1e-12)
+        i2 = int(np.argmax(np.abs((pts - pts[i0]) @ nv)))
+        if i2 in (i0, i1):
+            return None
+        tpl = []
+        for k in (i0, i1, i2):
+            tid = idmap[cells[k]]
+            tpl.append(_tpl_xy(tid // N_COL, tid % N_COL))
+        cr_t = ((tpl[1][0]-tpl[0][0])*(tpl[2][1]-tpl[0][1])
+                - (tpl[1][1]-tpl[0][1])*(tpl[2][0]-tpl[0][0]))
+        cr_i = ((pts[i1][0]-pts[i0][0])*(pts[i2][1]-pts[i0][1])
+                - (pts[i1][1]-pts[i0][1])*(pts[i2][0]-pts[i0][0]))
+        if abs(cr_t) < 1e-9 or abs(cr_i) < 1e-9:
+            return None
+        sgn = (1 if cr_t > 0 else -1) * (1 if cr_i > 0 else -1)
+        return (sgn < 0) if _PROPER_SIGN < 0 else (sgn > 0)
+
+    # flip_x 由掌性決定。舊規則「近排 col0 應在影像左」與 row0=近端組合是
+    # 鏡像標號（物理不可能），且相機側裝/倒裝時「影像左」亦失效。
     flip_x = False
-    if all(p is not None for p in nr):
-        flip_x = (nr[0][0] > nr[-1][0])
-        dbg.append(f"近排 col0_x={nr[0][0]:.0f} col4_x={nr[-1][0]:.0f}→{'flip_x' if flip_x else 'no flip_x'}")
-    idmap = {}
-    for r in range(N_ROW):
-        for c in range(N_COL):
-            r2 = (N_ROW - 1 - r) if flip_y else r
-            c2 = (N_COL - 1 - c) if flip_x else c
-            idmap[(r, c)] = r2 * N_COL + c2
-    return idmap, flip_y, flip_x, "; ".join(dbg)
+    ok_f = _labeling_proper(_make_idmap(flip_y, False))
+    ok_t = _labeling_proper(_make_idmap(flip_y, True))
+    if ok_f is True:
+        flip_x = False; dbg.append("掌性→no flip_x")
+    elif ok_t is True:
+        flip_x = True;  dbg.append("掌性→flip_x")
+    else:   # 退化後援：沿用近排影像 x 序
+        near = (N_ROW - 1) if flip_y else 0
+        nr = [proj.get((near, c)) for c in range(N_COL)]
+        if all(p is not None for p in nr):
+            flip_x = (nr[0][0] > nr[-1][0])
+        dbg.append(f"掌性退化，後援近排 x 序→{'flip_x' if flip_x else 'no flip_x'}")
+    return _make_idmap(flip_y, flip_x), flip_y, flip_x, "; ".join(dbg)
 
 
 def _line_consistency(H, line_members, node_pts, subset=None):
@@ -661,16 +718,18 @@ def _depth_vp(famA, famB, line_fits):
 
 
 def _vp_consistent(H, vp):
-    """近/遠定向：固定約定 metric y=13.40 端為『遠端』，應投影到較靠近深度消失點處。
-    回傳 +1（合）/ -1（不合）/ 0（無 VP）。"""
+    """近/遠定向：正典慣例 row0（metric y=13.40）為『近端』——與
+    _vp_relabel_ids（近側當 row0）及 _orient_score（+y→影像下）一致；
+    原版約定 row0=遠端與此二者矛盾，是方向不穩的來源之一。
+    row0 應投影到『離』深度消失點較遠處。回傳 +1（合）/ -1（不合）/ 0（無 VP）。"""
     if vp is None:
         return 0
-    p_far = _proj(H, (3.05, 13.40)); p_near = _proj(H, (3.05, 0.0))
-    if not all(math.isfinite(v) for v in (*p_far, *p_near)):
+    p_r0 = _proj(H, (3.05, 13.40)); p_r5 = _proj(H, (3.05, 0.0))
+    if not all(math.isfinite(v) for v in (*p_r0, *p_r5)):
         return 0
-    d_far = math.hypot(p_far[0] - vp[0], p_far[1] - vp[1])
-    d_near = math.hypot(p_near[0] - vp[0], p_near[1] - vp[1])
-    return 1 if d_far < d_near else -1
+    d_r0 = math.hypot(p_r0[0] - vp[0], p_r0[1] - vp[1])
+    d_r5 = math.hypot(p_r5[0] - vp[0], p_r5[1] - vp[1])
+    return 1 if d_r0 > d_r5 else -1
 
 
 def _pick_H_sym(base_corr, vp=None):
@@ -692,9 +751,12 @@ def _pick_H_sym(base_corr, vp=None):
         if sc <= -1e8:
             continue
         cand = {"name": name, "H": H, "score": sc, "twist": _grid_twist_ok(H),
+                "chi": 1 if _chirality_ok(H) else 0,
                 "vp": _vp_consistent(H, vp), "sym": sym}
-        if best is None or (cand["twist"], cand["vp"], cand["score"]) > \
-                           (best["twist"], best["vp"], best["score"]):
+        # 優先序：不折疊 > 掌性合法（物理硬約束，淘汰鏡像重標號 flipC/flipR）
+        #         > VP 近/遠一致 > 方向慣例（後兩者只需在 identity↔flipRC 間消歧）
+        if best is None or (cand["twist"], cand["chi"], cand["vp"], cand["score"]) > \
+                           (best["twist"], best["chi"], best["vp"], best["score"]):
             best = cand
     return best
 
@@ -1104,7 +1166,12 @@ def _solve_quad_prosac(sub_pts, sub_types, pool=None, same_line=None,
                 tpl = [_tpl_xy(*sym(t // N_COL, t % N_COL)) for t in tids]
                 if abs(_signed_area(tpl)) < 0.2:
                     continue
-                if (_signed_area(tpl) > 0) != sgn_img:
+                # 掌性奇偶：合法 H 把模板正向圖形映成影像「負向」。影像四點已由
+                # _ccw_order 排成正向，故模板四點須為「反向」才是合法對應；同向者
+                # 為鏡像假設（H 貼線但 cid 對調）。原式 != 恰好反了，會剪掉正解、
+                # 只留鏡像 → 修正並順帶剪掉一半無效假設。
+                tpl_pos = _signed_area(tpl) > 0
+                if (tpl_pos == sgn_img) == (_PROPER_SIGN < 0):
                     continue
                 cnt += 1
                 if cnt > 60:
