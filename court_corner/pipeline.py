@@ -59,6 +59,7 @@ class PipelineResult:
                 "line_support": round(lr.line_support, 4),
                 "line_support_ok": bool(lr.line_support_ok),
                 "solver_method": lr.method,
+                "attempt": lr.attempt,
                 "n_steger_refined": lr.n_steger_refined,
                 "n_courts": lr.n_courts,
                 "n_junctions": len(lr.junctions),
@@ -100,6 +101,7 @@ class CourtCornerPipeline:
                  dark: bool = False,
                  bright_lines: bool = None,
                  min_line_support: float = 0.45,
+                 device: str = None,
                  verbose: bool = True):
         self.verbose = verbose
         self.dark = dark
@@ -107,7 +109,8 @@ class CourtCornerPipeline:
         self.bright_lines = (not dark) if bright_lines is None else bright_lines
 
         # Stage 1
-        self.detector = JunctionDetector(yolo_weight, conf=yolo_conf, verbose=verbose)
+        self.detector = JunctionDetector(yolo_weight, conf=yolo_conf,
+                                         device=device, verbose=verbose)
         # Stage 2（線為主）
         from .stages.topology_line import LineHomographySolver
         self.line_solver = LineHomographySolver(
