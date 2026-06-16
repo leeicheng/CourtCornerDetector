@@ -1,0 +1,5 @@
+numpy>=1.21
+opencv-python>=4.5
+scipy>=1.7
+ultralytics>=8.0   # 僅第一階段 YOLO 偵測需要（延遲載入）
+PyQt6>=6.4         # 僅 GUI（court_corner_gui.py）需要
