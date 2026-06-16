@@ -78,7 +78,7 @@ def load_scene_map(args, imgs):
 def run(args):
     from court_corner.pipeline import CourtCornerPipeline
 
-    pipe = CourtCornerPipeline(args.weights, yolo_conf=0.05,
+    pipe = CourtCornerPipeline(args.weights, device=args.device, yolo_conf=0.05,
                                corner_conf=args.corner_conf,
                                dark=args.dark, verbose=False)
     imgs = find_images(args.img_dir)
@@ -113,6 +113,7 @@ def run(args):
                            solve_time_s=d["stage_times"].get("solve_H"))
                 if gt:
                     m, _oflip = match_by_cid_oriented(d["corners"], gt)
+                    m = [r for r in m if r.get("visibility") == "visible"]
                     errs = [r["err_px"] for r in m]
                     row["err_median"] = float(np.median(errs)) if errs else None
                     row["n_matched"] = len(m)
@@ -166,6 +167,8 @@ def build_parser():
     ap.add_argument("--img_dir", required=True)
     ap.add_argument("--gt_dir", default=None)
     ap.add_argument("--weights", default="best.pt")
+    ap.add_argument("--device", default=None,
+                    help="YOLO 推論裝置（0 / cuda:0 / cpu；預設自動）")
     ap.add_argument("--thresholds", type=float, nargs="+",
                     default=[0.8, 0.6, 0.4, 0.25])
     ap.add_argument("--corner_conf", type=float, default=0.6)

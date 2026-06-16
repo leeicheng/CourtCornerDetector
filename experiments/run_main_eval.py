@@ -43,6 +43,7 @@ def run(args):
 
     pipe = CourtCornerPipeline(
         args.weights, yolo_conf=args.yolo_conf, corner_conf=args.corner_conf,
+        device=args.device,
         dark=args.dark, min_line_support=args.min_line_support,
         verbose=not args.quiet)
 
@@ -120,6 +121,10 @@ def run(args):
 
 
 def summarize(rows, per_image, n_gt_total, args):
+    # 主協定：定位統計採 visible 分母（與全部基準一致）；
+    # 全納入統計另存為敏感度對照；hidden 列即 H 外推品質（5.3 H 評估）。
+    rows_all = rows
+    rows = [r for r in rows if r.get("visibility") == "visible"]
     errs = [r["err_px"] for r in rows]
     s = {"overall": error_stats(errs)}
 
@@ -189,6 +194,8 @@ def summarize(rows, per_image, n_gt_total, args):
     confs = [p.get("homography", {}).get("confidence") for p in per_image
              if p.get("status") == "ok"]
     s["h_confidence_counts"] = {c: confs.count(c) for c in ("high", "medium", "low")}
+    s["all_points_sensitivity"] = error_stats([r["err_px"] for r in rows_all])
+    s["all_points_sensitivity"]["n"] = len(rows_all)
     s["mean_line_support"] = float(np.mean(
         [p["homography"].get("line_support", np.nan) for p in per_image
          if p.get("status") == "ok"])) if confs else None
@@ -247,6 +254,8 @@ def build_parser():
     ap.add_argument("--img_dir", required=True)
     ap.add_argument("--gt_dir", default=None)
     ap.add_argument("--weights", default="best.pt")
+    ap.add_argument("--device", default=None,
+                    help="YOLO 推論裝置（0 / cuda:0 / cpu；預設自動）")
     ap.add_argument("--yolo_conf", type=float, default=0.4)
     ap.add_argument("--corner_conf", type=float, default=0.0,
                     help="預設 0：輸出全部候選，分析端再切")

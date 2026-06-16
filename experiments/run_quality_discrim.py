@@ -205,6 +205,8 @@ def run(args):
 
     for ip in imgs:
         gt = load_gt(ip, args.gt_dir)
+        gt = {k: g for k, g in gt.items()
+              if g.get("visibility", "visible") == "visible"}  # 主協定 visible 分母
         H = H_by_image.get(ip.name)
         if not gt or H is None:
             continue

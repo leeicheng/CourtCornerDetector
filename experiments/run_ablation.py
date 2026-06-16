@@ -33,7 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from experiments.common import (find_images, load_gt, match_by_cid,
                                 match_by_cid_oriented,
-                                error_stats, save_result, fmt)
+                                error_stats, save_result, fmt,
+                                visible_rows)
 
 
 # ---------------- 變體開關 ----------------
@@ -87,7 +88,7 @@ def run_variant(variant, args, imgs, gt_cache, det_cache):
     from court_corner.pipeline import CourtCornerPipeline
 
     corner_conf = 0.0 if variant == "no_quality" else args.corner_conf
-    pipe = CourtCornerPipeline(args.weights, yolo_conf=args.yolo_conf,
+    pipe = CourtCornerPipeline(args.weights, device=args.device, yolo_conf=args.yolo_conf,
                                corner_conf=corner_conf, dark=args.dark,
                                verbose=False)
     if variant == "no_steger":
@@ -163,13 +164,15 @@ def run(args):
     for v in variants:
         print(f"\n===== 變體：{v} =====")
         rows, per_image = run_variant(v, args, imgs, gt_cache, det_cache)
-        errs = [r["err_px"] for r in rows]
+        vrows = visible_rows(rows)
+        errs = [r["err_px"] for r in vrows]
         st = error_stats(errs)
+        st["all_points"] = error_stats([r["err_px"] for r in rows])  # 敏感度對照
         st["output_rate"] = (len(rows) / n_gt) if n_gt else None
         # 編號正確率：配對誤差 ≤ 門檻者視為編號正確
         st["cid_correct_rate"] = (float(np.mean(
-            [r["err_px"] <= args.cid_thresh for r in rows]))
-            if rows else None)
+            [r["err_px"] <= args.cid_thresh for r in vrows]))
+            if vrows else None)
         summary[v] = st
         detail[v] = per_image
         print(f"  中位數 {fmt(st['median'])}  P90 {fmt(st['p90'])}  "
@@ -193,6 +196,8 @@ def build_parser():
     ap.add_argument("--img_dir", required=True)
     ap.add_argument("--gt_dir", default=None)
     ap.add_argument("--weights", default="best.pt")
+    ap.add_argument("--device", default=None,
+                    help="YOLO 推論裝置（0 / cuda:0 / cpu；預設自動）")
     ap.add_argument("--yolo_conf", type=float, default=0.4)
     ap.add_argument("--corner_conf", type=float, default=0.6)
     ap.add_argument("--variants", nargs="*", default=None,

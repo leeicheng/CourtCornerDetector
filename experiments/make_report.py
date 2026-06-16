@@ -82,6 +82,8 @@ def sec_main(main, fig_dir, lines):
     errs, confs = [], []
     for p in main.get("per_image", []):
         for r in p.get("matched", []):
+            if r.get("visibility", "visible") != "visible":
+                continue   # 主協定：圖與統計同採 visible 分母
             errs.append(r["err_px"])
             confs.append(r.get("conf", 0))
     if errs:

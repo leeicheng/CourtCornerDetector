@@ -66,6 +66,10 @@ def main():
     args = ap.parse_args()
 
     files = sorted(Path(args.gt_dir).glob("*.gt.json"))
+    if not files:
+        print(f"目錄 {args.gt_dir} 內找不到任何 *.gt.json——請確認 GT 實際所在路徑")
+        sys.exit(1)
+    print(f"目錄內共 {len(files)} 個 GT 檔")
     for key in args.images:
         hits = [f for f in files if key in f.name]
         if len(hits) != 1:

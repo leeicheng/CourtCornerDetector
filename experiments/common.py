@@ -103,9 +103,11 @@ def match_by_cid_oriented(pred: List[dict], gt: Dict[int, dict],
     rows_rot = match_by_cid(pred_rot, gt)
 
     def key(rows):
-        if len(rows) < 4:
+        vis = [r for r in rows if r.get("visibility") == "visible"]
+        use = vis if len(vis) >= 4 else rows
+        if len(use) < 4:
             return (0, float("inf"))
-        return (1, float(np.median([r["err_px"] for r in rows])))
+        return (1, float(np.median([r["err_px"] for r in use])))
 
     k_id, k_rot = key(rows_id), key(rows_rot)
     if k_rot[0] > k_id[0] or (k_rot[0] == k_id[0] and k_rot[1] < k_id[1] - 1e-9):
@@ -131,6 +133,11 @@ def match_by_cid(pred: List[dict], gt: Dict[int, dict]) -> List[dict]:
                    visibility=g["visibility"])
         rows.append(row)
     return rows
+
+
+def visible_rows(rows):
+    """主協定分母：僅 visibility == "visible" 之配對列（與基準同分母）。"""
+    return [r for r in rows if r.get("visibility") == "visible"]
 
 
 def error_stats(errors, thresholds=(1.0, 2.0, 5.0)) -> dict:
